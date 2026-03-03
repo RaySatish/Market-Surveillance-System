@@ -11,8 +11,12 @@ Usage:
   streamlit run dashboard.py
 
 Reads from:
-  - HDFS: hdfs://localhost:9000/market/clean/trades/ (Parquet — via Spark)
-  - Local: alerts/ directory (CSVs — output of detection pipeline)
+  - trades.csv  (raw trade data)
+  - alerts/     (CSVs — output of detection pipeline)
+
+Deployment:
+  - Works on Streamlit Cloud (no Spark/HDFS needed)
+  - Commit trades.csv and alerts/ to your repo
 """
 
 import streamlit as st
@@ -22,10 +26,14 @@ import plotly.graph_objects as go
 from datetime import datetime
 import os
 
-from config import get_config
-from hdfs_utils import read_parquet_from_hdfs
-
-cfg = get_config()
+# ---------- paths (no Spark / HDFS needed) ----------
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+TRADES_CSV     = os.path.join(BASE_DIR, "trades.csv")
+ALERTS_DIR     = os.path.join(BASE_DIR, "alerts")
+ALERTS_WASH    = os.path.join(ALERTS_DIR, "alerts_wash.csv")
+ALERTS_PD      = os.path.join(ALERTS_DIR, "alerts_pump_dump.csv")
+ALERTS_SPOOF   = os.path.join(ALERTS_DIR, "alerts_spoofing.csv")
+ALERTS_ALL     = os.path.join(ALERTS_DIR, "all_alerts.csv")
 
 # ========== PAGE CONFIG ==========
 st.set_page_config(
@@ -41,19 +49,12 @@ st.markdown("Real-time monitoring of wash trades, pump & dump schemes, and spoof
 # ========== LOAD DATA ==========
 @st.cache_data
 def load_trades():
-    """Load cleaned trades from HDFS Parquet (Spark ETL output)."""
-    try:
-        df = read_parquet_from_hdfs(cfg["clean_output"])
+    """Load trade data from local CSV (works on Streamlit Cloud)."""
+    if os.path.exists(TRADES_CSV):
+        df = pd.read_csv(TRADES_CSV)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df
-    except Exception as e:
-        st.warning(f"Could not read from HDFS: {e}")
-        # Fallback to raw CSV if HDFS isn't available
-        if os.path.exists("trades.csv"):
-            df = pd.read_csv("trades.csv")
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            return df
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
 @st.cache_data
@@ -68,10 +69,10 @@ def load_alerts(filename):
 
 # Load everything
 trades = load_trades()
-wash_alerts = load_alerts(cfg["alerts_wash"])
-pd_alerts = load_alerts(cfg["alerts_pump_dump"])
-spoof_alerts = load_alerts(cfg["alerts_spoofing"])
-all_alerts = load_alerts(cfg["alerts_combined"])
+wash_alerts = load_alerts(ALERTS_WASH)
+pd_alerts = load_alerts(ALERTS_PD)
+spoof_alerts = load_alerts(ALERTS_SPOOF)
+all_alerts = load_alerts(ALERTS_ALL)
 
 # Check if detections have been run
 if all_alerts.empty and wash_alerts.empty and pd_alerts.empty and spoof_alerts.empty:
