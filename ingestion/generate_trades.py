@@ -2,6 +2,7 @@ import csv
 import uuid
 import random
 import time
+import os
 from datetime import datetime, timedelta
 
 # ---------------- CONFIG ----------------
@@ -13,7 +14,8 @@ START_PRICE = {
     "ETHUSDT": 2300,
     "SOLUSDT": 95
 }
-OUTPUT_FILE = "trades.csv"
+# Output goes to project root (one level up from ingestion/)
+OUTPUT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trades.csv")
 START_TIME = datetime.now() - timedelta(hours=1)
 # ----------------------------------------
 
@@ -114,37 +116,43 @@ def spoof_orders(ts, symbol):
     return orders
 
 # ---------------- MAIN ----------------
-with open(OUTPUT_FILE, "w", newline="") as f:
-    writer = csv.DictWriter(
-        f,
-        fieldnames=[
-            "trade_id", "timestamp", "symbol",
-            "price", "quantity", "side",
-            "trader_id", "order_id", "event_type"
-        ]
-    )
-    writer.writeheader()
+def generate_trades():
+    """Generate synthetic trade data with injected abuse patterns."""
+    with open(OUTPUT_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "trade_id", "timestamp", "symbol",
+                "price", "quantity", "side",
+                "trader_id", "order_id", "event_type"
+            ]
+        )
+        writer.writeheader()
 
-    current_time = START_TIME
+        current_time = START_TIME
 
-    for i in range(NUM_TRADES):
-        current_time += timedelta(milliseconds=random.randint(10, 100))
+        for i in range(NUM_TRADES):
+            current_time += timedelta(milliseconds=random.randint(10, 100))
 
-        symbol = random.choice(SYMBOLS)
+            symbol = random.choice(SYMBOLS)
 
-        # Inject abuse patterns occasionally
-        r = random.random()
+            # Inject abuse patterns occasionally
+            r = random.random()
 
-        if r < 0.02:
-            for t in wash_trade(current_time, symbol):
-                writer.writerow(t)
-        elif r < 0.04:
-            for t in pump_and_dump(current_time, symbol):
-                writer.writerow(t)
-        elif r < 0.06:
-            for t in spoof_orders(current_time, symbol):
-                writer.writerow(t)
-        else:
-            writer.writerow(normal_trade(current_time, symbol))
+            if r < 0.02:
+                for t in wash_trade(current_time, symbol):
+                    writer.writerow(t)
+            elif r < 0.04:
+                for t in pump_and_dump(current_time, symbol):
+                    writer.writerow(t)
+            elif r < 0.06:
+                for t in spoof_orders(current_time, symbol):
+                    writer.writerow(t)
+            else:
+                writer.writerow(normal_trade(current_time, symbol))
 
-print(f"Generated {OUTPUT_FILE}")
+    print(f"Generated {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    generate_trades()

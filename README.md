@@ -71,26 +71,38 @@ Includes an interactive **Streamlit dashboard** for visualizing alerts, price an
 ## Project Structure
 
 ```
-├── config.py                  # Central configuration (paths, thresholds, mode)
-├── generate_trades.py         # Generate synthetic trade data with injected abuse patterns
-├── ingest_to_hdfs.py          # Upload raw CSV to Hadoop HDFS
-├── etl_trades.py              # Spark ETL pipeline (Extract → Transform → Load)
-├── hdfs_utils.py              # HDFS/Spark helper functions
-├── detect_wash_trades.py      # Wash trade detection algorithm
-├── detect_pump_dump.py        # Pump & dump detection algorithm
-├── detect_spoofing.py         # Spoofing detection algorithm
-├── run_all_detections.py      # Master script — runs full pipeline end-to-end
-├── stream_binance.py          # Binance WebSocket live trade ingestion (Phase 2)
-├── dashboard.py               # Streamlit dashboard for visualization
-├── trades.csv                 # Raw synthetic trade data (~200K+ rows)
-├── requirements.txt           # Python dependencies
-├── alerts/
-│   ├── alerts_wash.csv        # Wash trade alerts
-│   ├── alerts_pump_dump.csv   # Pump & dump alerts
-│   ├── alerts_spoofing.csv    # Spoofing alerts
-│   └── all_alerts.csv         # Combined alert feed
-└── data/
-    └── clean/trades/          # Cleaned Parquet output (partitioned by symbol)
+├── README.md
+├── requirements.txt
+├── config.py                          # Central configuration (paths, thresholds, mode)
+├── run_all_detections.py              # Master script — runs full pipeline end-to-end
+├── dashboard.py                       # Streamlit dashboard (deployed on Streamlit Cloud)
+├── trades.csv                         # Raw synthetic trade data (~200K+ rows)
+│
+├── ingestion/                         # Data generation & ingestion layer
+│   ├── __init__.py
+│   ├── generate_trades.py             #   Generate synthetic trades with injected abuse
+│   ├── ingest_to_hdfs.py              #   Upload raw CSV to Hadoop HDFS
+│   └── stream_binance.py             #   Binance WebSocket live ingestion (Phase 2)
+│
+├── etl/                               # Extract–Transform–Load layer
+│   ├── __init__.py
+│   ├── etl_trades.py                  #   Spark ETL: CSV → clean → Parquet
+│   └── hdfs_utils.py                  #   HDFS/Spark helper functions
+│
+├── detectors/                         # Abuse detection algorithms
+│   ├── __init__.py
+│   ├── detect_wash_trades.py          #   Wash trade detection
+│   ├── detect_pump_dump.py            #   Pump & dump detection
+│   └── detect_spoofing.py            #   Spoofing detection
+│
+├── alerts/                            # Detection output (generated CSVs)
+│   ├── alerts_wash.csv
+│   ├── alerts_pump_dump.csv
+│   ├── alerts_spoofing.csv
+│   └── all_alerts.csv
+│
+└── data/                              # Cleaned Parquet output
+    └── clean/trades/                  #   Partitioned by symbol
 ```
 
 ---
@@ -158,18 +170,18 @@ python run_all_detections.py
 
 ```bash
 # Generate trades
-python generate_trades.py           # → trades.csv
+python -m ingestion.generate_trades    # → trades.csv
 
 # Upload to HDFS
-python ingest_to_hdfs.py            # → hdfs:///market/raw/trades.csv
+python -m ingestion.ingest_to_hdfs     # → hdfs:///market/raw/trades.csv
 
 # Run Spark ETL
-python etl_trades.py                # → hdfs:///market/clean/trades/ (Parquet)
+python -m etl.etl_trades               # → hdfs:///market/clean/trades/ (Parquet)
 
 # Run individual detectors
-python detect_wash_trades.py        # → alerts/alerts_wash.csv
-python detect_pump_dump.py          # → alerts/alerts_pump_dump.csv
-python detect_spoofing.py           # → alerts/alerts_spoofing.csv
+python -m detectors.detect_wash_trades  # → alerts/alerts_wash.csv
+python -m detectors.detect_pump_dump    # → alerts/alerts_pump_dump.csv
+python -m detectors.detect_spoofing     # → alerts/alerts_spoofing.csv
 ```
 
 ### Option 3: Skip ETL (if Parquet already exists)

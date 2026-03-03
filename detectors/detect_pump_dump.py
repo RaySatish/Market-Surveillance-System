@@ -26,7 +26,7 @@ import os
 from datetime import datetime, timedelta
 
 from config import get_config, DETECTION
-from hdfs_utils import read_parquet_from_hdfs
+from etl.hdfs_utils import read_parquet_from_hdfs
 
 
 def detect_pump_and_dump(

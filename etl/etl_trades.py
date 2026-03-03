@@ -32,7 +32,7 @@ from pyspark.sql.functions import col, to_timestamp, lit, when
 from pyspark.sql.types import DoubleType, IntegerType
 
 from config import get_config, MODE
-from hdfs_utils import get_or_create_spark
+from etl.hdfs_utils import get_or_create_spark
 
 
 def run_etl():

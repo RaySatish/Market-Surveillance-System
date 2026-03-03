@@ -25,11 +25,11 @@ import os
 from datetime import datetime
 
 from config import get_config, MODE
-from ingest_to_hdfs import ingest_to_hdfs
-from etl_trades import run_etl
-from detect_wash_trades import detect_wash_trades
-from detect_pump_dump import detect_pump_and_dump
-from detect_spoofing import detect_spoofing
+from ingestion.ingest_to_hdfs import ingest_to_hdfs
+from etl.etl_trades import run_etl
+from detectors.detect_wash_trades import detect_wash_trades
+from detectors.detect_pump_dump import detect_pump_and_dump
+from detectors.detect_spoofing import detect_spoofing
 
 
 def run_all(skip_etl=False):
