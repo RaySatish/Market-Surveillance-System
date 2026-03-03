@@ -247,10 +247,7 @@ if top_risk["risk_score"].max() > 0:
     st.plotly_chart(fig_risk, use_container_width=True)
 
     # Show the full table
-    st.dataframe(
-        top_risk.style.background_gradient(subset=["risk_score"], cmap="Reds"),
-        use_container_width=True
-    )
+    st.dataframe(top_risk, use_container_width=True)
 else:
     st.info("No risky traders detected.")
 
