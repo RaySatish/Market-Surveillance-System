@@ -25,11 +25,11 @@ Includes an interactive **Streamlit dashboard** for visualizing alerts, price an
 
 ## What It Detects
 
-| Abuse Type | What It Is | How We Detect It |
-|------------|-----------|------------------|
-| **Wash Trading** | Same trader buys AND sells the same asset at the same price/time to fake volume | Group by `(trader, symbol, price, time)` → check for both BUY + SELL sides |
-| **Pump & Dump** | Artificially inflate price with large buys, then dump at the peak | Rolling 5-min windows → detect price spikes ≥5% with volume imbalance ≥3:1 |
-| **Spoofing** | Place large fake orders to manipulate perception, then cancel before execution | Per-trader cancellation rate >50% AND cancelled order sizes >2× executed size |
+| Abuse Type       | What It Is                                                                      | How We Detect It                                                              |
+| ---------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **Wash Trading** | Same trader buys AND sells the same asset at the same price/time to fake volume | Group by `(trader, symbol, price, time)` → check for both BUY + SELL sides    |
+| **Pump & Dump**  | Artificially inflate price with large buys, then dump at the peak               | Rolling 5-min windows → detect price spikes ≥5% with volume imbalance ≥3:1    |
+| **Spoofing**     | Place large fake orders to manipulate perception, then cancel before execution  | Per-trader cancellation rate >50% AND cancelled order sizes >2× executed size |
 
 ---
 
@@ -109,15 +109,15 @@ Includes an interactive **Streamlit dashboard** for visualizing alerts, price an
 
 ## Tech Stack
 
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| **Data Generation** | Python `csv`, `random` | Synthetic trades with realistic abuse patterns injected |
-| **Storage** | Hadoop HDFS | Distributed filesystem — mirrors production architecture |
-| **ETL** | Apache Spark (PySpark) | Distributes processing across cores; scales from laptop to 100-node cluster |
-| **Data Format** | Parquet (columnar) | 5–10× compression vs CSV; 10–100× faster column scans |
-| **Detection** | Pandas + NumPy | Full-dataset analysis for pattern matching |
-| **Dashboard** | Streamlit + Plotly | Interactive web UI with real-time charts |
-| **Deployment** | Streamlit Cloud | Free hosting, auto-deploys from GitHub |
+| Layer               | Technology             | Why                                                                         |
+| ------------------- | ---------------------- | --------------------------------------------------------------------------- |
+| **Data Generation** | Python `csv`, `random` | Synthetic trades with realistic abuse patterns injected                     |
+| **Storage**         | Hadoop HDFS            | Distributed filesystem — mirrors production architecture                    |
+| **ETL**             | Apache Spark (PySpark) | Distributes processing across cores; scales from laptop to 100-node cluster |
+| **Data Format**     | Parquet (columnar)     | 5–10× compression vs CSV; 10–100× faster column scans                       |
+| **Detection**       | Pandas + NumPy         | Full-dataset analysis for pattern matching                                  |
+| **Dashboard**       | Streamlit + Plotly     | Interactive web UI with real-time charts                                    |
+| **Deployment**      | Streamlit Cloud        | Free hosting, auto-deploys from GitHub                                      |
 
 ---
 
@@ -211,14 +211,14 @@ Opens at **http://localhost:8501**
 
 ### Dashboard Sections
 
-| Section | What It Shows |
-|---------|--------------|
-| **Overview** | Total trades, alert counts, key metrics |
-| **Alert Severity** | Pie chart by type, bar chart by severity (CRITICAL / HIGH / MEDIUM) |
-| **Price Charts** | Price over time with abuse events overlaid as colored markers |
-| **Volume Analysis** | Volume by event type + volume over time (5-min buckets) |
-| **Trader Risk Scoreboard** | Top 20 riskiest traders ranked by weighted risk score |
-| **Raw Alert Tables** | Filterable tables for each alert type |
+| Section                    | What It Shows                                                       |
+| -------------------------- | ------------------------------------------------------------------- |
+| **Overview**               | Total trades, alert counts, key metrics                             |
+| **Alert Severity**         | Pie chart by type, bar chart by severity (CRITICAL / HIGH / MEDIUM) |
+| **Price Charts**           | Price over time with abuse events overlaid as colored markers       |
+| **Volume Analysis**        | Volume by event type + volume over time (5-min buckets)             |
+| **Trader Risk Scoreboard** | Top 20 riskiest traders ranked by weighted risk score               |
+| **Raw Alert Tables**       | Filterable tables for each alert type                               |
 
 ---
 
@@ -262,23 +262,23 @@ All settings are centralized in `config.py`:
 
 ### Detection Thresholds
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `wash_min_group_size` | 2 | Minimum trades in a group to flag as wash |
-| `pd_window_minutes` | 5 | Rolling window size for pump & dump detection |
-| `pd_price_spike_pct` | 0.05 | Minimum price spike (5%) to flag as pump |
-| `pd_volume_ratio` | 3.0 | Minimum buy/sell volume ratio for pump signal |
-| `spoof_cancel_rate` | 0.5 | Cancellation rate threshold (50%) |
-| `spoof_min_orders` | 3 | Minimum orders before evaluating a trader |
-| `spoof_size_multiplier` | 2.0 | How much larger cancelled orders must be vs executed |
+| Parameter               | Default | Description                                          |
+| ----------------------- | ------- | ---------------------------------------------------- |
+| `wash_min_group_size`   | 2       | Minimum trades in a group to flag as wash            |
+| `pd_window_minutes`     | 5       | Rolling window size for pump & dump detection        |
+| `pd_price_spike_pct`    | 0.05    | Minimum price spike (5%) to flag as pump             |
+| `pd_volume_ratio`       | 3.0     | Minimum buy/sell volume ratio for pump signal        |
+| `spoof_cancel_rate`     | 0.5     | Cancellation rate threshold (50%)                    |
+| `spoof_min_orders`      | 3       | Minimum orders before evaluating a trader            |
+| `spoof_size_multiplier` | 2.0     | How much larger cancelled orders must be vs executed |
 
 ### Data Paths
 
-| Setting | Value |
-|---------|-------|
-| Raw input | `hdfs://localhost:9000/market/raw/trades.csv` |
-| Clean output | `hdfs://localhost:9000/market/clean/trades` |
-| Alert CSVs | `alerts/` directory (local) |
+| Setting      | Value                                         |
+| ------------ | --------------------------------------------- |
+| Raw input    | `hdfs://localhost:9000/market/raw/trades.csv` |
+| Clean output | `hdfs://localhost:9000/market/clean/trades`   |
+| Alert CSVs   | `alerts/` directory (local)                   |
 
 ---
 
@@ -286,15 +286,15 @@ All settings are centralized in `config.py`:
 
 The pipeline is **designed to scale** to production on AWS with minimal code changes:
 
-| Component | Local (Phase 1) | AWS (Phase 2) |
-|-----------|-----------------|---------------|
-| **Data Source** | `generate_trades.py` (synthetic) | Binance WebSocket API (real-time) |
-| **Storage** | HDFS on localhost | Amazon S3 via EMRFS |
-| **Compute** | Spark `local[*]` | Spark on AWS EMR (YARN cluster) |
-| **Streaming** | `stream_binance.py --test` | Kafka / Kinesis → Spark Streaming |
-| **Dashboard** | Streamlit Cloud | Streamlit Cloud / EC2 |
-| **Alerting** | CSV files | SNS / CloudWatch / PagerDuty |
-| **Scheduling** | Manual `python run_all_detections.py` | Apache Airflow / Step Functions |
+| Component       | Local (Phase 1)                       | AWS (Phase 2)                     |
+| --------------- | ------------------------------------- | --------------------------------- |
+| **Data Source** | `generate_trades.py` (synthetic)      | Binance WebSocket API (real-time) |
+| **Storage**     | HDFS on localhost                     | Amazon S3 via EMRFS               |
+| **Compute**     | Spark `local[*]`                      | Spark on AWS EMR (YARN cluster)   |
+| **Streaming**   | `stream_binance.py --test`            | Kafka / Kinesis → Spark Streaming |
+| **Dashboard**   | Streamlit Cloud                       | Streamlit Cloud / EC2             |
+| **Alerting**    | CSV files                             | SNS / CloudWatch / PagerDuty      |
+| **Scheduling**  | Manual `python run_all_detections.py` | Apache Airflow / Step Functions   |
 
 To switch: change `MODE = "aws"` in `config.py` and configure your S3 bucket path.
 
@@ -303,6 +303,7 @@ To switch: change `MODE = "aws"` in `config.py` and configure your S3 bucket pat
 ## Sample Output
 
 **Wash Trade Alert:**
+
 ```
 alert_type: WASH_TRADE
 trader_id: T0001
@@ -313,6 +314,7 @@ severity: MEDIUM
 ```
 
 **Pump & Dump Alert:**
+
 ```
 alert_type: PUMP_AND_DUMP
 symbol: ETHUSDT
@@ -322,6 +324,7 @@ severity: CRITICAL
 ```
 
 **Spoofing Alert:**
+
 ```
 alert_type: SPOOFING
 trader_id: T0310
@@ -338,4 +341,4 @@ This project is for **educational and research purposes**.
 
 ---
 
-*Built with Apache Spark, Hadoop HDFS, Streamlit, and Python.*
+_Built with Apache Spark, Hadoop HDFS, Streamlit, and Python._
