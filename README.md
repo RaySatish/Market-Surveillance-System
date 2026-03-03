@@ -1,1 +1,329 @@
-# Market-Surveillance-for-Trade-Abuse-Detection
+# Market Surveillance for Trade Abuse Detection
+
+A **big-data pipeline** that detects market manipulation patterns — **wash trading**, **pump & dump schemes**, and **spoofing** — in cryptocurrency trade data using **Apache Spark**, **Hadoop HDFS**, and **Python**.
+
+Includes an interactive **Streamlit dashboard** for visualizing alerts, price anomalies, and trader risk scores.
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://your-app.streamlit.app)
+
+---
+
+## Table of Contents
+
+- [What It Detects](#what-it-detects)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Tech Stack](#tech-stack)
+- [Getting Started](#getting-started)
+- [Running the Pipeline](#running-the-pipeline)
+- [Dashboard](#dashboard)
+- [Detection Algorithms](#detection-algorithms)
+- [Configuration](#configuration)
+- [Future Roadmap (AWS Phase 2)](#future-roadmap-aws-phase-2)
+
+---
+
+## What It Detects
+
+| Abuse Type | What It Is | How We Detect It |
+|------------|-----------|------------------|
+| **Wash Trading** | Same trader buys AND sells the same asset at the same price/time to fake volume | Group by `(trader, symbol, price, time)` → check for both BUY + SELL sides |
+| **Pump & Dump** | Artificially inflate price with large buys, then dump at the peak | Rolling 5-min windows → detect price spikes ≥5% with volume imbalance ≥3:1 |
+| **Spoofing** | Place large fake orders to manipulate perception, then cancel before execution | Per-trader cancellation rate >50% AND cancelled order sizes >2× executed size |
+
+---
+
+## Architecture
+
+```
+┌─────────────────────┐
+│  generate_trades.py  │   Synthetic trade data (200K+ records)
+│  stream_binance.py   │   Live Binance WebSocket (Phase 2)
+└────────┬────────────┘
+         │  trades.csv
+         ▼
+┌─────────────────────┐
+│  ingest_to_hdfs.py   │   Upload raw CSV → HDFS
+└────────┬────────────┘
+         │  hdfs://localhost:9000/market/raw/
+         ▼
+┌─────────────────────┐
+│  etl_trades.py       │   Spark ETL: CSV → clean → Parquet
+│  (PySpark)           │   Type casting, null handling, derived columns
+└────────┬────────────┘
+         │  hdfs://localhost:9000/market/clean/trades/ (Parquet)
+         ▼
+┌─────────────────────────────────────────────┐
+│  detect_wash_trades.py                       │
+│  detect_pump_dump.py     Detection Layer     │
+│  detect_spoofing.py      (Pandas + Spark)    │
+└────────┬────────────────────────────────────┘
+         │  alerts/*.csv
+         ▼
+┌─────────────────────┐
+│  dashboard.py        │   Streamlit interactive dashboard
+│  (Streamlit + Plotly)│   Deployed on Streamlit Cloud
+└─────────────────────┘
+```
+
+---
+
+## Project Structure
+
+```
+├── config.py                  # Central configuration (paths, thresholds, mode)
+├── generate_trades.py         # Generate synthetic trade data with injected abuse patterns
+├── ingest_to_hdfs.py          # Upload raw CSV to Hadoop HDFS
+├── etl_trades.py              # Spark ETL pipeline (Extract → Transform → Load)
+├── hdfs_utils.py              # HDFS/Spark helper functions
+├── detect_wash_trades.py      # Wash trade detection algorithm
+├── detect_pump_dump.py        # Pump & dump detection algorithm
+├── detect_spoofing.py         # Spoofing detection algorithm
+├── run_all_detections.py      # Master script — runs full pipeline end-to-end
+├── stream_binance.py          # Binance WebSocket live trade ingestion (Phase 2)
+├── dashboard.py               # Streamlit dashboard for visualization
+├── trades.csv                 # Raw synthetic trade data (~200K+ rows)
+├── requirements.txt           # Python dependencies
+├── alerts/
+│   ├── alerts_wash.csv        # Wash trade alerts
+│   ├── alerts_pump_dump.csv   # Pump & dump alerts
+│   ├── alerts_spoofing.csv    # Spoofing alerts
+│   └── all_alerts.csv         # Combined alert feed
+└── data/
+    └── clean/trades/          # Cleaned Parquet output (partitioned by symbol)
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Why |
+|-------|-----------|-----|
+| **Data Generation** | Python `csv`, `random` | Synthetic trades with realistic abuse patterns injected |
+| **Storage** | Hadoop HDFS | Distributed filesystem — mirrors production architecture |
+| **ETL** | Apache Spark (PySpark) | Distributes processing across cores; scales from laptop to 100-node cluster |
+| **Data Format** | Parquet (columnar) | 5–10× compression vs CSV; 10–100× faster column scans |
+| **Detection** | Pandas + NumPy | Full-dataset analysis for pattern matching |
+| **Dashboard** | Streamlit + Plotly | Interactive web UI with real-time charts |
+| **Deployment** | Streamlit Cloud | Free hosting, auto-deploys from GitHub |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- **Python 3.9+**
+- **Java 11+** (required by Spark)
+- **Apache Hadoop** (HDFS) — for the full pipeline
+- **Apache Spark** (PySpark) — for the ETL layer
+
+### Installation
+
+```bash
+# Clone the repo
+git clone https://github.com/your-username/Market-Surveillance-for-Trade-Abuse-Detection.git
+cd Market-Surveillance-for-Trade-Abuse-Detection
+
+# Install Python dependencies
+pip install -r requirements.txt
+```
+
+### Verify Spark & Hadoop
+
+```bash
+java -version          # Should show Java 11+
+spark-submit --version # Should show Spark 3.x
+hdfs version           # Should show Hadoop 3.x
+```
+
+---
+
+## Running the Pipeline
+
+### Option 1: Full Pipeline (Recommended)
+
+```bash
+# 1. Start HDFS
+start-dfs.sh
+
+# 2. Generate synthetic trade data
+python generate_trades.py
+
+# 3. Run the complete pipeline (ingest → ETL → all detectors)
+python run_all_detections.py
+```
+
+### Option 2: Step by Step
+
+```bash
+# Generate trades
+python generate_trades.py           # → trades.csv
+
+# Upload to HDFS
+python ingest_to_hdfs.py            # → hdfs:///market/raw/trades.csv
+
+# Run Spark ETL
+python etl_trades.py                # → hdfs:///market/clean/trades/ (Parquet)
+
+# Run individual detectors
+python detect_wash_trades.py        # → alerts/alerts_wash.csv
+python detect_pump_dump.py          # → alerts/alerts_pump_dump.csv
+python detect_spoofing.py           # → alerts/alerts_spoofing.csv
+```
+
+### Option 3: Skip ETL (if Parquet already exists)
+
+```bash
+python run_all_detections.py --skip-etl
+```
+
+---
+
+## Dashboard
+
+### Run Locally
+
+```bash
+streamlit run dashboard.py
+```
+
+Opens at **http://localhost:8501**
+
+### Deploy on Streamlit Cloud
+
+1. Push your repo to GitHub (including `trades.csv` and `alerts/`)
+2. Go to [share.streamlit.io](https://share.streamlit.io)
+3. Select your repo → set main file to `dashboard.py`
+4. Click **Deploy**
+
+### Dashboard Sections
+
+| Section | What It Shows |
+|---------|--------------|
+| **Overview** | Total trades, alert counts, key metrics |
+| **Alert Severity** | Pie chart by type, bar chart by severity (CRITICAL / HIGH / MEDIUM) |
+| **Price Charts** | Price over time with abuse events overlaid as colored markers |
+| **Volume Analysis** | Volume by event type + volume over time (5-min buckets) |
+| **Trader Risk Scoreboard** | Top 20 riskiest traders ranked by weighted risk score |
+| **Raw Alert Tables** | Filterable tables for each alert type |
+
+---
+
+## Detection Algorithms
+
+### Wash Trade Detection
+
+```
+Group trades by (trader_id, symbol, timestamp, price)
+   → If same trader has BOTH BUY and SELL in the group → WASH TRADE
+   → Severity: MEDIUM (all wash trades)
+```
+
+### Pump & Dump Detection
+
+```
+For each symbol, use a rolling 5-minute window:
+   1. Calculate price change (%) from start to peak
+   2. Calculate buy/sell volume ratio
+   3. If price_change ≥ 5% AND buy_volume / sell_volume ≥ 3.0 → PUMP
+   4. If price drops after pump AND sell volume dominates → DUMP
+   → Severity: CRITICAL (pump+dump pair), HIGH (pump only)
+```
+
+### Spoofing Detection
+
+```
+For each trader:
+   1. Count total orders and cancelled orders
+   2. cancellation_rate = cancelled / total
+   3. Compare avg size of cancelled vs executed orders
+   4. If cancel_rate > 50% AND avg_cancelled_size > 2× avg_executed → SPOOFER
+   → Severity: HIGH (high cancel rate), CRITICAL (extreme size mismatch)
+```
+
+---
+
+## Configuration
+
+All settings are centralized in `config.py`:
+
+### Detection Thresholds
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `wash_min_group_size` | 2 | Minimum trades in a group to flag as wash |
+| `pd_window_minutes` | 5 | Rolling window size for pump & dump detection |
+| `pd_price_spike_pct` | 0.05 | Minimum price spike (5%) to flag as pump |
+| `pd_volume_ratio` | 3.0 | Minimum buy/sell volume ratio for pump signal |
+| `spoof_cancel_rate` | 0.5 | Cancellation rate threshold (50%) |
+| `spoof_min_orders` | 3 | Minimum orders before evaluating a trader |
+| `spoof_size_multiplier` | 2.0 | How much larger cancelled orders must be vs executed |
+
+### Data Paths
+
+| Setting | Value |
+|---------|-------|
+| Raw input | `hdfs://localhost:9000/market/raw/trades.csv` |
+| Clean output | `hdfs://localhost:9000/market/clean/trades` |
+| Alert CSVs | `alerts/` directory (local) |
+
+---
+
+## Future Roadmap (AWS Phase 2)
+
+The pipeline is **designed to scale** to production on AWS with minimal code changes:
+
+| Component | Local (Phase 1) | AWS (Phase 2) |
+|-----------|-----------------|---------------|
+| **Data Source** | `generate_trades.py` (synthetic) | Binance WebSocket API (real-time) |
+| **Storage** | HDFS on localhost | Amazon S3 via EMRFS |
+| **Compute** | Spark `local[*]` | Spark on AWS EMR (YARN cluster) |
+| **Streaming** | `stream_binance.py --test` | Kafka / Kinesis → Spark Streaming |
+| **Dashboard** | Streamlit Cloud | Streamlit Cloud / EC2 |
+| **Alerting** | CSV files | SNS / CloudWatch / PagerDuty |
+| **Scheduling** | Manual `python run_all_detections.py` | Apache Airflow / Step Functions |
+
+To switch: change `MODE = "aws"` in `config.py` and configure your S3 bucket path.
+
+---
+
+## Sample Output
+
+**Wash Trade Alert:**
+```
+alert_type: WASH_TRADE
+trader_id: T0001
+symbol: BTCUSDT
+price: 42002.24
+total_quantity: 48
+severity: MEDIUM
+```
+
+**Pump & Dump Alert:**
+```
+alert_type: PUMP_AND_DUMP
+symbol: ETHUSDT
+price_change_pct: 7.2%
+volume_ratio: 4.5
+severity: CRITICAL
+```
+
+**Spoofing Alert:**
+```
+alert_type: SPOOFING
+trader_id: T0310
+cancel_rate: 0.73
+avg_cancel_size: 142
+severity: HIGH
+```
+
+---
+
+## License
+
+This project is for **educational and research purposes**.
+
+---
+
+*Built with Apache Spark, Hadoop HDFS, Streamlit, and Python.*
