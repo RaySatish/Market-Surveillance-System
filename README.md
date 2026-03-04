@@ -16,6 +16,7 @@ Built as a production-ready prototype that runs locally and is designed to scale
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
+- [Fault Tolerance](#fault-tolerance)
 - [Getting Started](#getting-started)
 - [Running the Pipeline](#running-the-pipeline)
 - [Dashboard](#dashboard)
@@ -45,13 +46,14 @@ Built as a production-ready prototype that runs locally and is designed to scale
          │  trades.csv
          ▼
 ┌─────────────────────┐
-│  ingest_to_hdfs.py   │   Upload raw CSV → HDFS
+│  ingest_to_hdfs.py   │   Validate rows → Upload to HDFS (replication=3)
+│                      │   Bad rows → dead_letter/rejected_trades.csv
 └────────┬────────────┘
          │  hdfs://localhost:9000/market/raw/
          ▼
 ┌─────────────────────┐
 │  etl_trades.py       │   Spark ETL: CSV → clean → Parquet
-│  (PySpark)           │   Type casting, null handling, derived columns
+│  (PySpark)           │   Atomic staging write + rename
 └────────┬────────────┘
          │  hdfs://localhost:9000/market/clean/trades/ (Parquet)
          ▼
@@ -59,6 +61,7 @@ Built as a production-ready prototype that runs locally and is designed to scale
 │  detect_wash_trades.py                       │
 │  detect_pump_dump.py     Detection Layer     │
 │  detect_spoofing.py      (Pandas + Spark)    │
+│  ─── retry + idempotent atomic CSV writes ── │
 └────────┬────────────────────────────────────┘
          │  alerts/*.csv
          ▼
@@ -66,6 +69,14 @@ Built as a production-ready prototype that runs locally and is designed to scale
 │  dashboard.py        │   Streamlit interactive dashboard
 │  (Streamlit + Plotly)│   Deployed on Streamlit Cloud
 └─────────────────────┘
+
+         ┌──────────────────────────────────┐
+         │  utils/fault_tolerance.py         │  Cross-cutting concerns:
+         │  ── logging (rotating files)      │  retry, validation, DLQ,
+         │  ── retry with exp. backoff       │  checkpointing, idempotent
+         │  ── data validation + DLQ         │  writes
+         │  ── checkpoint / resume           │
+         └──────────────────────────────────┘
 ```
 
 ---
@@ -83,19 +94,23 @@ Built as a production-ready prototype that runs locally and is designed to scale
 ├── ingestion/                         # Data generation & ingestion layer
 │   ├── __init__.py
 │   ├── generate_trades.py             #   Generate synthetic trades with injected abuse
-│   ├── ingest_to_hdfs.py              #   Upload raw CSV to Hadoop HDFS
-│   └── stream_binance.py             #   Binance WebSocket live ingestion (Phase 2)
+│   ├── ingest_to_hdfs.py              #   Validate + upload raw CSV to HDFS (replication=3)
+│   └── stream_binance.py              #   Binance WebSocket live ingestion (auto-reconnect)
 │
 ├── etl/                               # Extract–Transform–Load layer
 │   ├── __init__.py
-│   ├── etl_trades.py                  #   Spark ETL: CSV → clean → Parquet
-│   └── hdfs_utils.py                  #   HDFS/Spark helper functions
+│   ├── etl_trades.py                  #   Spark ETL: CSV → clean → Parquet (atomic writes)
+│   └── hdfs_utils.py                  #   HDFS/Spark helpers (retry-wrapped)
 │
 ├── detectors/                         # Abuse detection algorithms
 │   ├── __init__.py
 │   ├── detect_wash_trades.py          #   Wash trade detection
 │   ├── detect_pump_dump.py            #   Pump & dump detection
-│   └── detect_spoofing.py            #   Spoofing detection
+│   └── detect_spoofing.py             #   Spoofing detection
+│
+├── utils/                             # Shared fault-tolerance utilities
+│   ├── __init__.py
+│   └── fault_tolerance.py             #   Logging, retry, validation, DLQ, checkpoints
 │
 ├── alerts/                            # Detection output (generated CSVs)
 │   ├── alerts_wash.csv
@@ -103,7 +118,11 @@ Built as a production-ready prototype that runs locally and is designed to scale
 │   ├── alerts_spoofing.csv
 │   └── all_alerts.csv
 │
-└── data/                              # Cleaned Parquet output
+├── logs/                              # Rotating log files (auto-generated, .gitignored)
+├── dead_letter/                       # Rejected rows for auditing (.gitignored)
+├── .checkpoints/                      # Pipeline resume state (.gitignored)
+│
+└── data/                              # Cleaned Parquet output (.gitignored)
     └── clean/trades/                  #   Partitioned by symbol
 ```
 
@@ -122,6 +141,23 @@ Built as a production-ready prototype that runs locally and is designed to scale
 | **Deployment**      | Streamlit Cloud        | Free hosting, auto-deploys from GitHub                                      |
 
 ---
+
+## Fault Tolerance
+
+The pipeline is built with production-grade resilience:
+
+| Mechanism                          | Description                                                                                                 | Where                                    |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| **Retry with Exponential Backoff** | Failed operations retry up to 3× with increasing delays (1s → 2s → 4s)                                      | HDFS ingestion, Spark ETL, Parquet reads |
+| **HDFS Replication Factor = 3**    | Every HDFS block is stored on 3 datanodes for redundancy                                                    | `config.py` → `HDFS_REPLICATION_FACTOR`  |
+| **Data Validation**                | Every trade row is validated (positive price, valid side/symbol/timestamp) before HDFS upload               | `ingest_to_hdfs.py`, `stream_binance.py` |
+| **Dead Letter Queue**              | Invalid/rejected rows are persisted to `dead_letter/rejected_trades.csv` for auditing                       | `utils/fault_tolerance.py`               |
+| **Atomic/Idempotent CSV Writes**   | Alert CSVs are written to a `.tmp` file first, then atomically renamed; SHA-256 dedup skips unchanged files | All detectors                            |
+| **Atomic Parquet Writes**          | Spark writes to a staging directory, then renames to the final path — prevents partial-write corruption     | `etl_trades.py`                          |
+| **Pipeline Checkpointing**         | Each stage saves a checkpoint; use `--resume` to skip completed stages after a crash                        | `run_all_detections.py`                  |
+| **Detector Isolation**             | One failing detector doesn't crash the whole pipeline — errors are logged and execution continues           | `run_all_detections.py`                  |
+| **WebSocket Auto-Reconnect**       | Binance stream reconnects up to 10× with exponential backoff on disconnect                                  | `stream_binance.py`                      |
+| **Structured Logging**             | Rotating file + console logger (5 MB, 5 backups) replaces all `print()` calls                               | `utils/fault_tolerance.py` → `logs/`     |
 
 ## Getting Started
 
@@ -190,6 +226,13 @@ python -m detectors.detect_spoofing     # → alerts/alerts_spoofing.csv
 
 ```bash
 python run_all_detections.py --skip-etl
+```
+
+### Option 4: Resume After a Crash
+
+```bash
+# If the pipeline failed mid-run, resume from the last completed stage
+python run_all_detections.py --resume
 ```
 
 ---
@@ -264,15 +307,16 @@ All settings are centralized in `config.py`:
 
 ### Detection Thresholds
 
-| Parameter               | Default | Description                                          |
-| ----------------------- | ------- | ---------------------------------------------------- |
-| `wash_min_group_size`   | 2       | Minimum trades in a group to flag as wash            |
-| `pd_window_minutes`     | 5       | Rolling window size for pump & dump detection        |
-| `pd_price_spike_pct`    | 0.05    | Minimum price spike (5%) to flag as pump             |
-| `pd_volume_ratio`       | 3.0     | Minimum buy/sell volume ratio for pump signal        |
-| `spoof_cancel_rate`     | 0.5     | Cancellation rate threshold (50%)                    |
-| `spoof_min_orders`      | 3       | Minimum orders before evaluating a trader            |
-| `spoof_size_multiplier` | 2.0     | How much larger cancelled orders must be vs executed |
+| Parameter                 | Default | Description                                          |
+| ------------------------- | ------- | ---------------------------------------------------- |
+| `wash_min_group_size`     | 2       | Minimum trades in a group to flag as wash            |
+| `pd_window_minutes`       | 5       | Rolling window size for pump & dump detection        |
+| `pd_price_spike_pct`      | 5       | Minimum price spike (5%) to flag as pump             |
+| `pd_volume_ratio`         | 3.0     | Minimum buy/sell volume ratio for pump signal        |
+| `spoof_cancel_rate`       | 0.5     | Cancellation rate threshold (50%)                    |
+| `spoof_min_orders`        | 3       | Minimum orders before evaluating a trader            |
+| `spoof_size_multiplier`   | 2.0     | How much larger cancelled orders must be vs executed |
+| `HDFS_REPLICATION_FACTOR` | 3       | Number of HDFS block replicas for fault tolerance    |
 
 ### Data Paths
 
