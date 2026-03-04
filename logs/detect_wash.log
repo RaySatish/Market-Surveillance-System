@@ -1,0 +1,18 @@
+[2026-03-04 17:24:27] INFO     detect_wash — Loading cleaned trades from HDFS Parquet…
+[2026-03-04 17:24:40] INFO     detect_wash — Total trades loaded: 377,799
+[2026-03-04 17:24:51] INFO     detect_wash — Wrote 3987 rows → alerts/alerts_wash.csv
+[2026-03-04 17:24:51] INFO     detect_wash — WASH TRADE ALERTS: 3987
+[2026-03-04 17:24:51] INFO     detect_wash — Unique traders flagged: 499
+[2026-03-04 17:24:51] INFO     detect_wash — Symbols affected: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+[2026-03-04 17:24:51] INFO     detect_wash — Sample alerts:
+alert_type trader_id  symbol                  timestamp    price  total_quantity  num_trades severity                detected_at
+WASH_TRADE     T0001 BTCUSDT 2026-01-06T13:43:33.684233 42002.24              48           2   MEDIUM 2026-03-04T17:24:41.484006
+WASH_TRADE     T0001 BTCUSDT 2026-01-06T13:45:43.428233 41996.48              24           2   MEDIUM 2026-03-04T17:24:41.484257
+WASH_TRADE     T0001 BTCUSDT 2026-01-06T14:20:06.440233 42000.49              48           2   MEDIUM 2026-03-04T17:24:41.485802
+WASH_TRADE     T0001 BTCUSDT 2026-01-06T14:29:28.416233 41999.80              42           2   MEDIUM 2026-03-04T17:24:41.486044
+WASH_TRADE     T0001 BTCUSDT 2026-01-06T15:47:36.880233 42000.19              30           2   MEDIUM 2026-03-04T17:24:41.489467
+WASH_TRADE     T0001 ETHUSDT 2026-01-06T14:10:08.768233  2301.09              60           2     HIGH 2026-03-04T17:24:41.491470
+WASH_TRADE     T0001 ETHUSDT 2026-01-06T15:02:45.360233  2303.25              60           2     HIGH 2026-03-04T17:24:41.493897
+WASH_TRADE     T0001 SOLUSDT 2026-01-06T13:24:00.919233    91.43              34           2   MEDIUM 2026-03-04T17:24:41.496585
+WASH_TRADE     T0001 SOLUSDT 2026-01-06T13:25:19.042233    97.87              38           2   MEDIUM 2026-03-04T17:24:41.496719
+WASH_TRADE     T0001 SOLUSDT 2026-01-06T13:39:31.839233    94.17              46           2   MEDIUM 2026-03-04T17:24:41.497370

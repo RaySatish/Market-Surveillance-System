@@ -22,6 +22,11 @@ How this script detects it:
      - Large average cancelled order size (suggests intentional spoofing,
        not just normal order changes)
 
+Fault tolerance:
+  - HDFS Parquet read retries automatically (via hdfs_utils).
+  - Alert CSV is written atomically (safe_write_csv) to prevent corruption.
+  - Structured logging replaces print().
+
 Data flow:
   generate_trades.py → trades.csv → HDFS → etl_trades.py (Spark) → HDFS Parquet → THIS SCRIPT
 """
@@ -32,6 +37,9 @@ from datetime import datetime
 
 from config import get_config, DETECTION
 from etl.hdfs_utils import read_parquet_from_hdfs
+from utils.fault_tolerance import get_logger, safe_write_csv
+
+log = get_logger("detect_spoofing")
 
 
 def detect_spoofing(
@@ -62,56 +70,43 @@ def detect_spoofing(
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     # ---------- STEP 1: Load cleaned Parquet from HDFS ----------
-    print("Loading cleaned trades from HDFS Parquet...")
+    log.info("Loading cleaned trades from HDFS Parquet…")
     df = read_parquet_from_hdfs(input_path)
-    print(f"  Total trades loaded: {len(df):,}")
+    log.info("Total trades loaded: %s", f"{len(df):,}")
 
     # ---------- STEP 2: Split into executed and cancelled ----------
     cancelled = df[df["event_type"] == "CANCELLED"]
     executed = df[df["event_type"].isin(["TRADE", "WASH", "PUMP", "DUMP"])]
 
-    print(f"  Executed orders: {len(executed):,}")
-    print(f"  Cancelled orders: {len(cancelled):,}")
+    log.info("Executed orders: %s  |  Cancelled orders: %s",
+             f"{len(executed):,}", f"{len(cancelled):,}")
 
     # ---------- STEP 3: Per-trader statistics ----------
     alerts = []
-
-    # Get all unique traders who have at least one cancellation
     traders_with_cancels = cancelled["trader_id"].unique()
 
     for trader in traders_with_cancels:
-        # This trader's orders
         trader_cancelled = cancelled[cancelled["trader_id"] == trader]
         trader_executed = executed[executed["trader_id"] == trader]
 
         total_orders = len(trader_cancelled) + len(trader_executed)
-
-        # Skip if too few orders (not enough data to judge)
         if total_orders < min_orders:
             continue
 
         # ---------- STEP 4: Calculate suspicion metrics ----------
-
-        # Cancellation rate
         cancel_rate = len(trader_cancelled) / total_orders
-
-        # Average order size comparison
         avg_cancel_size = trader_cancelled["quantity"].mean()
         avg_exec_size = trader_executed["quantity"].mean() if len(trader_executed) > 0 else 0
 
-        # Size ratio: how much bigger are cancelled orders?
         if avg_exec_size > 0:
             size_ratio = avg_cancel_size / avg_exec_size
         else:
-            # Trader ONLY cancels, never executes → very suspicious
             size_ratio = float("inf")
 
-        # Symbols affected
         symbols = trader_cancelled["symbol"].unique().tolist()
 
         # ---------- STEP 5: Apply thresholds ----------
         if cancel_rate >= cancel_rate_threshold and size_ratio >= size_multiplier:
-            # Determine severity based on how extreme the metrics are
             if cancel_rate > 0.8 and size_ratio > 5:
                 severity = "CRITICAL"
             elif cancel_rate > 0.6 or size_ratio > 3:
@@ -134,18 +129,18 @@ def detect_spoofing(
                 "detected_at": datetime.now().isoformat()
             })
 
-    # ---------- STEP 6: Save results ----------
+    # ---------- STEP 6: Save results (atomic / idempotent) ----------
     alerts_df = pd.DataFrame(alerts)
-    alerts_df.to_csv(output_file, index=False)
+    safe_write_csv(alerts_df, output_file, logger=log)
 
-    print(f"\n  SPOOFING ALERTS: {len(alerts_df)}")
+    log.info("SPOOFING ALERTS: %d", len(alerts_df))
     if not alerts_df.empty:
-        print(f"  Unique traders flagged: {alerts_df['trader_id'].nunique()}")
-        print(f"  Critical severity: {len(alerts_df[alerts_df['severity'] == 'CRITICAL'])}")
-        print(f"  High severity:     {len(alerts_df[alerts_df['severity'] == 'HIGH'])}")
-        print(f"  Medium severity:   {len(alerts_df[alerts_df['severity'] == 'MEDIUM'])}")
-        print(f"\n  Sample alerts:")
-        print(alerts_df.head(10).to_string(index=False))
+        log.info("Unique traders flagged: %d", alerts_df["trader_id"].nunique())
+        log.info("Critical: %d  |  High: %d  |  Medium: %d",
+                 len(alerts_df[alerts_df["severity"] == "CRITICAL"]),
+                 len(alerts_df[alerts_df["severity"] == "HIGH"]),
+                 len(alerts_df[alerts_df["severity"] == "MEDIUM"]))
+        log.info("Sample alerts:\n%s", alerts_df.head(10).to_string(index=False))
 
     return alerts_df
 

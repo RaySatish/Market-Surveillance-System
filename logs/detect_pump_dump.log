@@ -1,0 +1,8 @@
+[2026-03-04 17:24:52] INFO     detect_pump_dump — Loading cleaned trades from HDFS Parquet…
+[2026-03-04 17:25:04] INFO     detect_pump_dump — Total trades loaded: 377,799
+[2026-03-04 17:25:05] INFO     detect_pump_dump — Wrote 1 rows → alerts/alerts_pump_dump.csv
+[2026-03-04 17:25:05] INFO     detect_pump_dump — PUMP & DUMP ALERTS: 1
+[2026-03-04 17:25:05] INFO     detect_pump_dump — Pump signals: 1  |  Dump signals: 0  |  Confirmed P&D: 0
+[2026-03-04 17:25:05] INFO     detect_pump_dump — Sample alerts:
+   alert_type  symbol        window_start          window_end  price_start  price_end  price_change_pct  buy_volume  sell_volume  num_trades severity                detected_at
+PUMP_DETECTED SOLUSDT 2026-01-06 16:15:00 2026-01-06 16:20:00        87.36      95.55             9.375       75065        22544        1050     HIGH 2026-03-04T17:25:05.069759

@@ -20,11 +20,18 @@ Performance note:
   - In a true distributed deployment, detection logic would also run in Spark
     (e.g., using groupBy + UDF). We use pandas here for clarity and because
     our dataset fits in memory.
+
+Fault tolerance:
+  - Spark session creation and Parquet reads are wrapped with retry/backoff.
+  - HDFS replication factor is set to 3 (configurable in config.py).
 """
 
 from pyspark.sql import SparkSession
 
-from config import get_config, MODE
+from config import get_config, MODE, HDFS_REPLICATION_FACTOR
+from utils.fault_tolerance import get_logger, retry
+
+log = get_logger("hdfs_utils")
 
 
 def get_or_create_spark(app_name="MarketSurveillance"):
@@ -35,12 +42,16 @@ def get_or_create_spark(app_name="MarketSurveillance"):
       - If run_all_detections.py already started a Spark session for ETL,
         this reuses it (no duplicate JVM startup).
       - If a detector runs standalone, this creates a fresh session.
+
+    Fault tolerance:
+      - Sets HDFS replication factor to HDFS_REPLICATION_FACTOR (default 3).
     """
     cfg = get_config()
 
     builder = SparkSession.builder \
         .appName(app_name) \
-        .master(cfg["spark_master"])
+        .master(cfg["spark_master"]) \
+        .config("spark.hadoop.dfs.replication", str(HDFS_REPLICATION_FACTOR))
 
     # AWS needs the S3 filesystem connector
     if MODE == "aws":
@@ -52,9 +63,12 @@ def get_or_create_spark(app_name="MarketSurveillance"):
 
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    log.info("Spark session ready (master=%s, replication=%d)",
+             cfg["spark_master"], HDFS_REPLICATION_FACTOR)
     return spark
 
 
+@retry(max_retries=3, base_delay=2.0, exceptions=(Exception,))
 def read_parquet_from_hdfs(path=None):
     """
     Read a Parquet dataset from HDFS (or S3) and return a pandas DataFrame.
@@ -65,22 +79,20 @@ def read_parquet_from_hdfs(path=None):
     Returns:
         pandas DataFrame with all columns from the Parquet.
 
-    How it works:
-      1. SparkSession.read.parquet(hdfs://...) → Spark DataFrame (distributed)
-      2. .toPandas() → pulls data to driver memory as a pandas DataFrame
-      3. Detection scripts then run normal pandas logic on it.
+    Fault tolerance:
+      - Retries up to 3 times with exponential back-off on HDFS read failures.
     """
     cfg = get_config()
     if path is None:
         path = cfg["clean_output"]
 
-    print(f"  Reading Parquet from HDFS: {path}")
+    log.info("Reading Parquet from HDFS: %s", path)
 
     spark = get_or_create_spark()
     spark_df = spark.read.parquet(path)
 
     record_count = spark_df.count()
-    print(f"  Records in HDFS Parquet: {record_count:,}")
+    log.info("Records in HDFS Parquet: %s", f"{record_count:,}")
 
     # Convert distributed Spark DataFrame → local pandas DataFrame
     pdf = spark_df.toPandas()

@@ -15,6 +15,11 @@ How this script detects it:
      - But buying AND selling at the exact same price/time = wash trade.
   4. Flag those trades and save alerts to a CSV.
 
+Fault tolerance:
+  - HDFS Parquet read retries automatically (via hdfs_utils).
+  - Alert CSV is written atomically (safe_write_csv) to prevent corruption.
+  - Structured logging replaces print().
+
 Data flow:
   generate_trades.py → trades.csv → HDFS → etl_trades.py (Spark) → HDFS Parquet → THIS SCRIPT
 """
@@ -25,6 +30,9 @@ from datetime import datetime
 
 from config import get_config, DETECTION
 from etl.hdfs_utils import read_parquet_from_hdfs
+from utils.fault_tolerance import get_logger, safe_write_csv
+
+log = get_logger("detect_wash")
 
 
 def detect_wash_trades(input_path=None, output_file=None):
@@ -44,15 +52,11 @@ def detect_wash_trades(input_path=None, output_file=None):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     # ---------- STEP 1: Load the cleaned Parquet from HDFS ----------
-    # Spark reads the Parquet from HDFS, then .toPandas() brings it into memory.
-    # This mirrors production: on AWS EMR, Spark reads from S3 the same way.
-    print("Loading cleaned trades from HDFS Parquet...")
+    log.info("Loading cleaned trades from HDFS Parquet…")
     df = read_parquet_from_hdfs(input_path)
-    print(f"  Total trades loaded: {len(df):,}")
+    log.info("Total trades loaded: %s", f"{len(df):,}")
 
     # ---------- STEP 2: Group by trader + symbol + time + price ----------
-    # We group on these 4 columns because a wash trade happens when the SAME
-    # trader trades the SAME symbol at the SAME time for the SAME price.
     group_cols = ["trader_id", "symbol", "timestamp", "price"]
     grouped = df.groupby(group_cols)
 
@@ -62,7 +66,6 @@ def detect_wash_trades(input_path=None, output_file=None):
     for (trader, symbol, ts, price), group in grouped:
         sides = set(group["side"].values)
 
-        # If this group has both BUY and SELL → wash trade
         if "BUY" in sides and "SELL" in sides:
             total_qty = group["quantity"].sum()
             wash_alerts.append({
@@ -77,16 +80,15 @@ def detect_wash_trades(input_path=None, output_file=None):
                 "detected_at": datetime.now().isoformat()
             })
 
-    # ---------- STEP 4: Save results ----------
+    # ---------- STEP 4: Save results (atomic / idempotent) ----------
     alerts_df = pd.DataFrame(wash_alerts)
-    alerts_df.to_csv(output_file, index=False)
+    safe_write_csv(alerts_df, output_file, logger=log)
 
-    print(f"\n  WASH TRADE ALERTS: {len(alerts_df)}")
+    log.info("WASH TRADE ALERTS: %d", len(alerts_df))
     if not alerts_df.empty:
-        print(f"  Unique traders flagged: {alerts_df['trader_id'].nunique()}")
-        print(f"  Symbols affected: {alerts_df['symbol'].unique().tolist()}")
-        print(f"\n  Sample alerts:")
-        print(alerts_df.head(10).to_string(index=False))
+        log.info("Unique traders flagged: %d", alerts_df["trader_id"].nunique())
+        log.info("Symbols affected: %s", alerts_df["symbol"].unique().tolist())
+        log.info("Sample alerts:\n%s", alerts_df.head(10).to_string(index=False))
 
     return alerts_df
 

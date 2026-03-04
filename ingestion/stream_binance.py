@@ -13,9 +13,15 @@ How it works:
   1. Connect to Binance WebSocket (wss://stream.binance.com)
   2. Subscribe to trade streams for BTC, ETH, SOL
   3. Each incoming trade is:
-     a. Written to a CSV buffer (batch file)
-     b. When buffer reaches BATCH_SIZE, flush to disk
-     c. The ETL pipeline picks up new files and processes them
+     a. Validated (row-level data quality check).
+     b. Written to a CSV buffer (batch file)
+     c. When buffer reaches BATCH_SIZE, flush to disk
+     d. The ETL pipeline picks up new files and processes them
+
+Fault tolerance:
+  - Auto-reconnect with exponential back-off if the WebSocket drops.
+  - Row-level validation; invalid messages go to the dead-letter queue.
+  - Structured logging (rotating file + console).
 
 Phase 2 (AWS) flow:
   Binance WebSocket → This script → Kafka/Kinesis → Spark Streaming → S3 → Detectors
@@ -41,7 +47,9 @@ import argparse
 from datetime import datetime
 
 from config import get_config, MODE
+from utils.fault_tolerance import get_logger, validate_trade, write_dead_letter
 
+log = get_logger("stream_binance")
 
 # ============================================================
 #  CONFIGURATION
@@ -49,17 +57,10 @@ from config import get_config, MODE
 BATCH_SIZE = 1000          # Flush to disk every N trades
 OUTPUT_DIR = "data/streaming"  # Where batch files land
 
-# Binance WebSocket trade message format (what you receive):
-# {
-#   "e": "trade",        ← event type
-#   "s": "BTCUSDT",      ← symbol
-#   "p": "42000.50",     ← price
-#   "q": "0.5",          ← quantity
-#   "b": 12345,          ← buyer order ID
-#   "a": 67890,          ← seller order ID
-#   "T": 1672531200000,  ← trade time (ms since epoch)
-#   "m": true            ← is buyer the market maker?
-# }
+# Auto-reconnect settings
+MAX_RECONNECT_ATTEMPTS = 10
+RECONNECT_BASE_DELAY = 1.0  # seconds
+RECONNECT_BACKOFF = 2.0     # multiplier
 
 
 def parse_binance_trade(msg):
@@ -73,8 +74,8 @@ def parse_binance_trade(msg):
         "symbol": msg["s"],
         "price": float(msg["p"]),
         "quantity": int(float(msg["q"])),
-        "side": "SELL" if msg["m"] else "BUY",  # m=true means buyer is maker → taker sold
-        "trader_id": f"B{msg['b']}",  # Use buyer order ID as pseudo-trader
+        "side": "SELL" if msg["m"] else "BUY",
+        "trader_id": f"B{msg['b']}",
         "order_id": str(msg.get("a", uuid.uuid4())),
         "event_type": "TRADE"
     }
@@ -99,7 +100,7 @@ def flush_batch(batch, batch_num):
         writer.writeheader()
         writer.writerows(batch)
 
-    print(f"  Flushed batch {batch_num}: {len(batch)} trades → {filename}")
+    log.info("Flushed batch %d: %d trades → %s", batch_num, len(batch), filename)
     return filename
 
 
@@ -111,15 +112,15 @@ def run_simulated_stream(num_batches=5):
     Simulate a Binance-like stream using synthetic data.
     Useful for testing the pipeline without internet/API access.
     """
-    print("SIMULATED STREAM MODE")
-    print(f"  Generating {num_batches} batches of {BATCH_SIZE} trades each")
-    print(f"  Output: {OUTPUT_DIR}/")
-    print()
+    log.info("SIMULATED STREAM MODE")
+    log.info("Generating %d batches of %d trades each", num_batches, BATCH_SIZE)
+    log.info("Output: %s/", OUTPUT_DIR)
 
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     base_prices = {"BTCUSDT": 42000, "ETHUSDT": 2300, "SOLUSDT": 95}
     batch = []
     batch_num = 0
+    rejected = 0
 
     total_trades = num_batches * BATCH_SIZE
 
@@ -136,21 +137,26 @@ def run_simulated_stream(num_batches=5):
             "order_id": str(uuid.uuid4()),
             "event_type": "TRADE"
         }
-        batch.append(trade)
+
+        # Validate before accepting
+        ok, reason = validate_trade(trade)
+        if ok:
+            batch.append(trade)
+        else:
+            write_dead_letter(trade, reason)
+            rejected += 1
 
         if len(batch) >= BATCH_SIZE:
             flush_batch(batch, batch_num)
             batch = []
             batch_num += 1
-
-            # Simulate real-time delay between batches
             time.sleep(0.5)
 
-    # Flush remaining
     if batch:
         flush_batch(batch, batch_num)
 
-    print(f"\nSimulation complete: {total_trades} trades in {batch_num + 1} batches")
+    log.info("Simulation complete: %d trades in %d batches (%d rejected → DLQ)",
+             total_trades, batch_num + 1, rejected)
 
 
 # ============================================================
@@ -160,69 +166,100 @@ def run_live_stream():
     """
     Connect to the real Binance WebSocket API and stream live trades.
     Requires: pip install websocket-client
+
+    Fault tolerance:
+      - Auto-reconnects up to MAX_RECONNECT_ATTEMPTS with exponential back-off.
+      - Invalid messages are logged and sent to the dead-letter queue.
     """
     try:
         import websocket
     except ImportError:
-        print("ERROR: Install websocket-client first:")
-        print("  pip install websocket-client")
+        log.error("Install websocket-client first:  pip install websocket-client")
         return
 
     cfg = get_config()
     symbols = cfg.get("binance_symbols", ["btcusdt@trade", "ethusdt@trade", "solusdt@trade"])
     ws_url = cfg.get("binance_ws_url", "wss://stream.binance.com:9443/ws")
-
-    # Combine multiple streams into one connection
     stream_url = f"{ws_url}/{'/'.join(symbols)}"
 
-    print("LIVE STREAM MODE")
-    print(f"  Connecting to: {stream_url}")
-    print(f"  Symbols: {symbols}")
-    print(f"  Batch size: {BATCH_SIZE}")
-    print()
+    log.info("LIVE STREAM MODE")
+    log.info("Connecting to: %s", stream_url)
+    log.info("Symbols: %s", symbols)
+    log.info("Batch size: %d", BATCH_SIZE)
 
     batch = []
     batch_num = 0
+    reconnect_attempts = 0
+    reconnect_delay = RECONNECT_BASE_DELAY
 
-    def on_message(ws, message):
-        nonlocal batch, batch_num
+    def _connect():
+        nonlocal reconnect_attempts, reconnect_delay
 
-        msg = json.loads(message)
-        trade = parse_binance_trade(msg)
-        batch.append(trade)
+        def on_message(ws, message):
+            nonlocal batch, batch_num
+            try:
+                msg = json.loads(message)
+                trade = parse_binance_trade(msg)
 
-        if len(batch) >= BATCH_SIZE:
-            flush_batch(batch, batch_num)
-            batch = []
-            batch_num += 1
+                ok, reason = validate_trade(trade)
+                if ok:
+                    batch.append(trade)
+                else:
+                    write_dead_letter(trade, reason)
+                    log.warning("Invalid trade rejected: %s", reason)
 
-    def on_error(ws, error):
-        print(f"WebSocket error: {error}")
+                if len(batch) >= BATCH_SIZE:
+                    flush_batch(batch, batch_num)
+                    batch = []
+                    batch_num += 1
+            except (KeyError, ValueError, TypeError) as exc:
+                log.error("Malformed WebSocket message: %s — %s", exc, message[:200])
+                write_dead_letter({"raw_message": message[:500]}, f"parse_error:{exc}")
 
-    def on_close(ws, close_status, close_msg):
-        print(f"WebSocket closed: {close_status} {close_msg}")
-        # Flush remaining trades
-        if batch:
-            flush_batch(batch, batch_num)
+        def on_error(ws, error):
+            log.error("WebSocket error: %s", error)
 
-    def on_open(ws):
-        print("Connected to Binance WebSocket!")
-        print("Streaming trades... (Ctrl+C to stop)\n")
+        def on_close(ws, close_status, close_msg):
+            nonlocal reconnect_attempts, reconnect_delay
+            log.warning("WebSocket closed: %s %s", close_status, close_msg)
+            if batch:
+                flush_batch(batch, batch_num)
 
-    ws = websocket.WebSocketApp(
-        stream_url,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-        on_open=on_open
-    )
+            # ---- AUTO-RECONNECT with exponential back-off ----
+            if reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+                reconnect_attempts += 1
+                log.warning("Reconnecting in %.1fs… (attempt %d/%d)",
+                            reconnect_delay, reconnect_attempts, MAX_RECONNECT_ATTEMPTS)
+                time.sleep(reconnect_delay)
+                reconnect_delay *= RECONNECT_BACKOFF
+                _connect()  # recursive reconnect
+            else:
+                log.error("Max reconnect attempts (%d) reached — giving up.",
+                          MAX_RECONNECT_ATTEMPTS)
 
-    try:
-        ws.run_forever()
-    except KeyboardInterrupt:
-        print(f"\nStopped. Total batches: {batch_num}")
-        if batch:
-            flush_batch(batch, batch_num)
+        def on_open(ws):
+            nonlocal reconnect_attempts, reconnect_delay
+            reconnect_attempts = 0          # reset on successful connect
+            reconnect_delay = RECONNECT_BASE_DELAY
+            log.info("Connected to Binance WebSocket!")
+            log.info("Streaming trades… (Ctrl+C to stop)")
+
+        ws = websocket.WebSocketApp(
+            stream_url,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open
+        )
+
+        try:
+            ws.run_forever()
+        except KeyboardInterrupt:
+            log.info("Stopped by user. Total batches: %d", batch_num)
+            if batch:
+                flush_batch(batch, batch_num)
+
+    _connect()
 
 
 # ============================================================

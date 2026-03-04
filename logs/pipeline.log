@@ -1,0 +1,23 @@
+[2026-03-04 17:24:00] INFO     pipeline — ============================================================
+[2026-03-04 17:24:00] INFO     pipeline —   MARKET SURVEILLANCE — FULL PIPELINE
+[2026-03-04 17:24:00] INFO     pipeline —   Mode:        LOCAL
+[2026-03-04 17:24:00] INFO     pipeline —   Run Time:    2026-03-04 17:24:00
+[2026-03-04 17:24:00] INFO     pipeline —   Input:       hdfs://localhost:9000/market/raw/trades.csv
+[2026-03-04 17:24:00] INFO     pipeline —   Output:      hdfs://localhost:9000/market/clean/trades
+[2026-03-04 17:24:00] INFO     pipeline —   Replication: 3
+[2026-03-04 17:24:00] INFO     pipeline —   Resume:      False
+[2026-03-04 17:24:00] INFO     pipeline — ============================================================
+[2026-03-04 17:24:00] INFO     pipeline — [0/4] HDFS INGESTION — Upload CSV to HDFS
+[2026-03-04 17:24:09] INFO     pipeline — [1/4] SPARK ETL PIPELINE — HDFS CSV → HDFS Parquet
+[2026-03-04 17:24:27] INFO     pipeline — [2/4] WASH TRADE DETECTION
+[2026-03-04 17:24:52] INFO     pipeline — [3/4] PUMP & DUMP DETECTION
+[2026-03-04 17:25:05] INFO     pipeline — [4/4] SPOOFING DETECTION
+[2026-03-04 17:25:29] INFO     pipeline — COMBINING ALL ALERTS
+[2026-03-04 17:25:29] INFO     pipeline — Wrote 3988 rows → alerts/all_alerts.csv
+[2026-03-04 17:25:29] INFO     pipeline — Total alerts generated: 3988
+[2026-03-04 17:25:29] INFO     pipeline — CRITICAL: 0  |  HIGH: 981  |  MEDIUM: 3007
+[2026-03-04 17:25:29] INFO     pipeline — Saved to: alerts/all_alerts.csv
+[2026-03-04 17:25:29] INFO     pipeline — ============================================================
+[2026-03-04 17:25:29] INFO     pipeline —   PIPELINE COMPLETE
+[2026-03-04 17:25:29] INFO     pipeline — ============================================================
+[2026-03-04 17:25:29] INFO     pipeline — Spark session stopped.

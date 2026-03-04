@@ -90,6 +90,11 @@ def get_config():
     return LOCAL
 
 
+# HDFS replication factor (set to 3 for fault tolerance)
+# In pseudo-distributed mode (single datanode) Hadoop will use min(3, #datanodes).
+# On a real cluster or AWS EMR this gives 3-copy redundancy.
+HDFS_REPLICATION_FACTOR = 3
+
 # Detection thresholds (same for both modes)
 DETECTION = {
     # Wash trade
@@ -97,7 +102,7 @@ DETECTION = {
 
     # Pump & dump
     "pd_window_minutes": 5,
-    "pd_price_spike_pct": 0.05,
+    "pd_price_spike_pct": 5,
     "pd_volume_ratio": 3.0,
 
     # Spoofing

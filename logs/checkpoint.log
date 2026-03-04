@@ -1,0 +1,7 @@
+[2026-03-04 17:24:00] INFO     checkpoint — All checkpoints cleared
+[2026-03-04 17:24:09] INFO     checkpoint — Checkpoint saved: ingest
+[2026-03-04 17:24:27] INFO     checkpoint — Checkpoint saved: etl
+[2026-03-04 17:24:52] INFO     checkpoint — Checkpoint saved: detect_wash
+[2026-03-04 17:25:05] INFO     checkpoint — Checkpoint saved: detect_pd
+[2026-03-04 17:25:29] INFO     checkpoint — Checkpoint saved: detect_spoof
+[2026-03-04 17:25:29] INFO     checkpoint — Checkpoint saved: combine

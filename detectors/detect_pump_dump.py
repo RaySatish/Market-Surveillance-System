@@ -16,6 +16,11 @@ How this script detects it:
      - If price drops sharply AND sell volume dominates → DUMP
   4. If a PUMP is followed by a DUMP in the same symbol → flag it.
 
+Fault tolerance:
+  - HDFS Parquet read retries automatically (via hdfs_utils).
+  - Alert CSV is written atomically (safe_write_csv) to prevent corruption.
+  - Structured logging replaces print().
+
 Data flow:
   generate_trades.py → trades.csv → HDFS → etl_trades.py (Spark) → HDFS Parquet → THIS SCRIPT
 """
@@ -27,6 +32,9 @@ from datetime import datetime, timedelta
 
 from config import get_config, DETECTION
 from etl.hdfs_utils import read_parquet_from_hdfs
+from utils.fault_tolerance import get_logger, safe_write_csv
+
+log = get_logger("detect_pump_dump")
 
 
 def detect_pump_and_dump(
@@ -56,36 +64,28 @@ def detect_pump_and_dump(
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     # ---------- STEP 1: Load cleaned Parquet from HDFS ----------
-    print("Loading cleaned trades from HDFS Parquet...")
+    log.info("Loading cleaned trades from HDFS Parquet…")
     df = read_parquet_from_hdfs(input_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
-    print(f"  Total trades loaded: {len(df):,}")
+    log.info("Total trades loaded: %s", f"{len(df):,}")
 
     # ---------- STEP 2: Analyze each symbol separately ----------
     alerts = []
 
     for symbol in df["symbol"].unique():
         sym_df = df[df["symbol"] == symbol].copy()
-
-        # Create time-based windows
-        # We use pd.Grouper to bucket trades into fixed time intervals
         sym_df.set_index("timestamp", inplace=True)
-
-        # Resample into time windows
         windows = sym_df.resample(f"{window_minutes}min")
 
-        prev_window_type = None  # Track if previous window was a PUMP
+        prev_window_type = None
 
         for window_start, window_df in windows:
             if len(window_df) < 5:
-                # Skip windows with too few trades (not meaningful)
                 prev_window_type = None
                 continue
 
             # ---------- STEP 3: Calculate metrics for this window ----------
-
-            # Price change from first to last trade in window
             price_start = window_df["price"].iloc[0]
             price_end = window_df["price"].iloc[-1]
             price_max = window_df["price"].max()
@@ -93,11 +93,9 @@ def detect_pump_and_dump(
 
             price_change_pct = ((price_end - price_start) / price_start) * 100
 
-            # Volume split by side
             buy_volume = window_df[window_df["side"] == "BUY"]["quantity"].sum()
             sell_volume = window_df[window_df["side"] == "SELL"]["quantity"].sum()
 
-            # Avoid division by zero
             if sell_volume == 0:
                 vol_ratio = float("inf")
             else:
@@ -109,8 +107,6 @@ def detect_pump_and_dump(
                 sell_ratio = sell_volume / buy_volume
 
             # ---------- STEP 4: Classify the window ----------
-
-            # PUMP: Price went UP sharply + BUY volume dominates
             if price_change_pct > price_spike_pct and vol_ratio > volume_ratio_threshold:
                 window_type = "PUMP"
                 alerts.append({
@@ -128,7 +124,6 @@ def detect_pump_and_dump(
                     "detected_at": datetime.now().isoformat()
                 })
 
-            # DUMP: Price went DOWN sharply + SELL volume dominates
             elif price_change_pct < -price_spike_pct and sell_ratio > volume_ratio_threshold:
                 window_type = "DUMP"
                 severity = "CRITICAL" if prev_window_type == "PUMP" else "HIGH"
@@ -153,20 +148,18 @@ def detect_pump_and_dump(
 
             prev_window_type = window_type
 
-    # ---------- STEP 5: Save results ----------
+    # ---------- STEP 5: Save results (atomic / idempotent) ----------
     alerts_df = pd.DataFrame(alerts)
-    alerts_df.to_csv(output_file, index=False)
+    safe_write_csv(alerts_df, output_file, logger=log)
 
-    print(f"\n  PUMP & DUMP ALERTS: {len(alerts_df)}")
+    log.info("PUMP & DUMP ALERTS: %d", len(alerts_df))
     if not alerts_df.empty:
         pump_count = len(alerts_df[alerts_df["alert_type"] == "PUMP_DETECTED"])
         dump_count = len(alerts_df[alerts_df["alert_type"] == "DUMP_DETECTED"])
         confirmed = len(alerts_df[alerts_df["alert_type"] == "PUMP_AND_DUMP_CONFIRMED"])
-        print(f"  Pump signals:     {pump_count}")
-        print(f"  Dump signals:     {dump_count}")
-        print(f"  Confirmed P&D:    {confirmed}")
-        print(f"\n  Sample alerts:")
-        print(alerts_df.head(10).to_string(index=False))
+        log.info("Pump signals: %d  |  Dump signals: %d  |  Confirmed P&D: %d",
+                 pump_count, dump_count, confirmed)
+        log.info("Sample alerts:\n%s", alerts_df.head(10).to_string(index=False))
 
     return alerts_df
 

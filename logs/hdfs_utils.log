@@ -1,0 +1,10 @@
+[2026-03-04 17:24:12] INFO     hdfs_utils — Spark session ready (master=local[*], replication=3)
+[2026-03-04 17:24:27] INFO     hdfs_utils — Reading Parquet from HDFS: hdfs://localhost:9000/market/clean/trades
+[2026-03-04 17:24:27] INFO     hdfs_utils — Spark session ready (master=local[*], replication=3)
+[2026-03-04 17:24:27] INFO     hdfs_utils — Records in HDFS Parquet: 377,799
+[2026-03-04 17:24:52] INFO     hdfs_utils — Reading Parquet from HDFS: hdfs://localhost:9000/market/clean/trades
+[2026-03-04 17:24:52] INFO     hdfs_utils — Spark session ready (master=local[*], replication=3)
+[2026-03-04 17:24:52] INFO     hdfs_utils — Records in HDFS Parquet: 377,799
+[2026-03-04 17:25:05] INFO     hdfs_utils — Reading Parquet from HDFS: hdfs://localhost:9000/market/clean/trades
+[2026-03-04 17:25:05] INFO     hdfs_utils — Spark session ready (master=local[*], replication=3)
+[2026-03-04 17:25:05] INFO     hdfs_utils — Records in HDFS Parquet: 377,799
