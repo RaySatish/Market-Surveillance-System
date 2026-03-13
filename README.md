@@ -2,7 +2,7 @@
 
 ## About
 
-Market Surveillance for Trade Abuse Detection is a **big-data analytics pipeline** built to identify manipulative trading patterns in financial markets. It processes **200K+ trade records** using **Apache Spark** and **Hadoop HDFS**, detects three major abuse types — **wash trading**, **pump & dump**, and **spoofing** — and surfaces results through an interactive **Streamlit dashboard** with real-time charts, severity-ranked alerts, and trader risk scores.
+Market Surveillance for Trade Abuse Detection is a **big-data analytics pipeline** built to identify manipulative trading patterns in financial markets. It processes **300K+ trade records** using **Apache Spark** and **Hadoop HDFS**, detects three major abuse types — **wash trading**, **pump & dump**, and **spoofing** — and surfaces results through an interactive **Streamlit dashboard** with real-time charts, severity-ranked alerts, and trader risk scores.
 
 Built as a production-ready prototype that runs locally and is designed to scale to **AWS EMR** with a single config change.
 
