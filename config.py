@@ -4,16 +4,22 @@ PIPELINE CONFIGURATION
 Central config that controls WHERE data lives and HOW it's processed.
 
 PHASE 1 (now):  MODE = "local"
-  - Synthetic data from generate_trades.py
-  - Spark reads/writes via HDFS (Hadoop on localhost)
-  - Raw CSV is uploaded to HDFS, Spark ETL writes Parquet to HDFS
+  - Batch pull from Binance REST API (fetch_binance.py) — real market data
+  - Spark reads/writes local filesystem (no HDFS)
   - Alerts written locally (small CSVs from pandas)
+  - Detectors: Wash Trade (statistical Z-score), Pump & Dump
 
-PHASE 2 (later): MODE = "aws"
-  - Real-time data from Binance WebSocket API
-  - Spark on AWS EMR (Hadoop/YARN managed by EMR)
-  - HDFS/EMRFS backed by S3 (s3a://)
-  - Streaming via Kafka / Kinesis
+PHASE 2 (laptop streaming):  MODE = "local" + Kafka
+  - Same local paths; Spark Structured Streaming reads from Kafka topic
+  - Kafka runs in Docker (KRaft single-broker, no Zookeeper)
+
+PHASE 3 (AWS):  MODE = "aws"
+  - Binance REST API → S3; Spark on EMR; same code, just change MODE
+
+NOTE: Spoofing detection has been permanently removed.
+  Binance public aggTrades API does not expose CANCELLED order events.
+  Spoofing detection is not possible on real exchange data without
+  private order-book access (e.g. exchange co-location feeds).
 
 Just change MODE to "aws" and fill in the AWS settings — everything adapts.
 """
@@ -25,58 +31,57 @@ import os
 # ============================================================
 MODE = "local"  # "local" or "aws"
 
-# HDFS namenode URI (from your core-site.xml)
-HDFS_NAMENODE = "hdfs://localhost:9000"
-
-# Local file that generate_trades.py produces (on disk, before HDFS upload)
-LOCAL_CSV = os.path.join(os.path.dirname(__file__), "trades.csv")
+# Project root (directory containing this file)
+_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 # ============================================================
-#  LOCAL SETTINGS (Phase 1 — Hadoop + Spark on your machine)
+#  LOCAL SETTINGS (Phase 1 & 2 — laptop, local filesystem)
 # ============================================================
 LOCAL = {
     "spark_master": "local[*]",
 
-    # HDFS path: raw CSV uploaded here by ingest_to_hdfs.py
-    "raw_input": f"{HDFS_NAMENODE}/market/raw/trades.csv",
+    # Raw CSV produced by fetch_binance.py (real data)
+    # or generate_trades.py (synthetic data for development/testing)
+    "trades_csv": os.path.join(_ROOT, "trades.csv"),
 
-    # HDFS path: Spark ETL writes cleaned Parquet here
-    "clean_output": f"{HDFS_NAMENODE}/market/clean/trades",
+    # Parquet output from Spark ETL (partitioned by symbol)
+    "parquet_dir": os.path.join(_ROOT, "data", "parquet"),
 
-    # Alerts stay local (pandas writes small CSVs, dashboard reads them)
-    "alerts_dir": "alerts",
-    "alerts_wash": "alerts/alerts_wash.csv",
-    "alerts_pump_dump": "alerts/alerts_pump_dump.csv",
-    "alerts_spoofing": "alerts/alerts_spoofing.csv",
-    "alerts_combined": "alerts/all_alerts.csv",
+    # Alerts (written by detectors, read by dashboard)
+    "alerts_dir":       os.path.join(_ROOT, "alerts"),
+    "alerts_wash":      os.path.join(_ROOT, "alerts", "alerts_wash.csv"),
+    "alerts_pump_dump": os.path.join(_ROOT, "alerts", "alerts_pump_dump.csv"),
+    "alerts_combined":  os.path.join(_ROOT, "alerts", "all_alerts.csv"),
+
+    # Kafka (Phase 2 streaming — Docker KRaft broker)
+    "kafka_bootstrap": "localhost:9092",
+    "kafka_topic":     "market-trades",
 }
 
 
 # ============================================================
-#  AWS SETTINGS (Phase 2 — EMR production on cloud)
+#  AWS SETTINGS (Phase 3 — EMR + S3)
 # ============================================================
 AWS = {
     "spark_master": "yarn",  # EMR manages Spark via YARN
 
     # S3 paths (replace with your bucket)
-    "raw_input": "s3a://your-bucket/market/raw/trades/",
-    "clean_output": "s3a://your-bucket/market/clean/trades/",
+    "trades_csv":       "s3a://your-bucket/market/raw/trades.csv",
+    "parquet_dir":      "s3a://your-bucket/market/clean/trades",
 
     # Alert outputs on S3
-    "alerts_dir": "s3a://your-bucket/market/alerts/",
-    "alerts_wash": "s3a://your-bucket/market/alerts/alerts_wash.csv",
+    "alerts_dir":       "s3a://your-bucket/market/alerts/",
+    "alerts_wash":      "s3a://your-bucket/market/alerts/alerts_wash.csv",
     "alerts_pump_dump": "s3a://your-bucket/market/alerts/alerts_pump_dump.csv",
-    "alerts_spoofing": "s3a://your-bucket/market/alerts/alerts_spoofing.csv",
-    "alerts_combined": "s3a://your-bucket/market/alerts/all_alerts.csv",
+    "alerts_combined":  "s3a://your-bucket/market/alerts/all_alerts.csv",
 
-    # Binance API (Phase 2)
-    "binance_ws_url": "wss://stream.binance.com:9443/ws",
-    "binance_symbols": ["btcusdt@trade", "ethusdt@trade", "solusdt@trade"],
+    # Binance REST API
+    "binance_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
 
-    # Kafka / Kinesis (Phase 2 — streaming ingestion)
+    # Kafka / Kinesis (Phase 3 streaming)
     "kafka_bootstrap": "your-kafka-broker:9092",
-    "kafka_topic": "market-trades",
+    "kafka_topic":     "market-trades",
 }
 
 
@@ -90,23 +95,18 @@ def get_config():
     return LOCAL
 
 
-# HDFS replication factor (set to 3 for fault tolerance)
-# In pseudo-distributed mode (single datanode) Hadoop will use min(3, #datanodes).
-# On a real cluster or AWS EMR this gives 3-copy redundancy.
-HDFS_REPLICATION_FACTOR = 3
-
-# Detection thresholds (same for both modes)
+# Detection thresholds (same for all modes — centralised here, never hardcoded in detectors)
 DETECTION = {
-    # Wash trade
-    "wash_min_group_size": 2,
+    # Wash trade — statistical Z-score (no real trader_id from Binance public API)
+    # Group-based detection is used only when trader_id is present (synthetic/dev data)
+    "wash_zscore_threshold": 3.0,       # flag windows where volume Z-score > this
+    "wash_rolling_window":   "5min",    # rolling window size for volume baseline
 
     # Pump & dump
-    "pd_window_minutes": 5,
-    "pd_price_spike_pct": 5,
-    "pd_volume_ratio": 3.0,
+    "pd_window_minutes":   5,
+    "pd_price_spike_pct":  5,
+    "pd_volume_ratio":     3.0,
 
-    # Spoofing
-    "spoof_cancel_rate": 0.5,
-    "spoof_min_orders": 3,
-    "spoof_size_multiplier": 2.0,
+    # NOTE: Spoofing thresholds removed — detection not possible on Binance public data.
+    # Binance aggTrades API only returns executed trades, never CANCELLED orders.
 }

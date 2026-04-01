@@ -3,12 +3,16 @@ RUN FULL PIPELINE
 =================
 This is the master script that runs the COMPLETE pipeline:
 
-  0. HDFS Ingestion           → uploads raw CSV to HDFS
-  1. ETL (Spark)              → reads CSV from HDFS → cleans → writes Parquet to HDFS
-  2. Wash Trade Detection     → reads HDFS Parquet via Spark → alerts_wash.csv
-  3. Pump & Dump Detection    → reads HDFS Parquet via Spark → alerts_pump_dump.csv
-  4. Spoofing Detection       → reads HDFS Parquet via Spark → alerts_spoofing.csv
-  5. Combine all alerts       → all_alerts.csv (unified view)
+  0. (Optional) Fetch trades  → fetch_binance.py or generate_trades.py
+  1. ETL (Spark)              → reads local CSV → cleans → writes local Parquet
+  2. Wash Trade Detection     → reads local Parquet → alerts_wash.csv
+  3. Pump & Dump Detection    → reads local Parquet → alerts_pump_dump.csv
+  4. Combine all alerts       → all_alerts.csv (unified view)
+
+NOTE: Spoofing detection has been removed.
+  Spoofing requires CANCELLED order events. Binance public aggTrades API
+  never exposes cancellations — only executed trades. Detection is not
+  possible on real data, so the entire spoofing stage has been dropped.
 
 Fault tolerance:
   - Each step is checkpointed; a resumed run skips completed stages.
@@ -18,12 +22,12 @@ Fault tolerance:
   - Structured logging replaces print() for full auditability.
 
 Architecture:
-  Phase 1 (local):  trades.csv → HDFS → Spark local → HDFS Parquet → detectors → alerts
+  Phase 1 (local):  trades.csv → Spark local → local Parquet → detectors → alerts
   Phase 2 (AWS):    Binance API → S3 → EMR Spark → S3 Parquet → detectors → dashboard
 
 Usage:
   python run_all_detections.py
-  python run_all_detections.py --skip-etl   (skip HDFS ingestion + Spark ETL)
+  python run_all_detections.py --skip-etl   (skip Spark ETL, use existing Parquet)
   python run_all_detections.py --resume     (resume from last checkpoint)
 """
 
@@ -32,12 +36,10 @@ import pandas as pd
 import os
 from datetime import datetime
 
-from config import get_config, MODE, HDFS_REPLICATION_FACTOR
-from ingestion.ingest_to_hdfs import ingest_to_hdfs
+from config import get_config, MODE
 from etl.etl_trades import run_etl
 from detectors.detect_wash_trades import detect_wash_trades
 from detectors.detect_pump_dump import detect_pump_and_dump
-from detectors.detect_spoofing import detect_spoofing
 from utils.fault_tolerance import (
     get_logger, safe_write_csv,
     save_checkpoint, load_checkpoint, clear_checkpoints,
@@ -68,29 +70,18 @@ def run_all(skip_etl=False, resume=False):
 
     log.info("=" * 60)
     log.info("  MARKET SURVEILLANCE — FULL PIPELINE")
-    log.info("  Mode:        %s", MODE.upper())
-    log.info("  Run Time:    %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    log.info("  Input:       %s", cfg["raw_input"])
-    log.info("  Output:      %s", cfg["clean_output"])
-    log.info("  Replication: %d", HDFS_REPLICATION_FACTOR)
-    log.info("  Resume:      %s", resume)
+    log.info("  Mode:      %s", MODE.upper())
+    log.info("  Run Time:  %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("  Input CSV: %s", cfg["trades_csv"])
+    log.info("  Parquet:   %s", cfg["parquet_dir"])
+    log.info("  Resume:    %s", resume)
+    log.info("  Detectors: Wash Trade, Pump & Dump  (Spoofing removed — not detectable on real data)")
     log.info("=" * 60)
 
-    # ---------- STEP 0 + 1: HDFS Ingestion + ETL ----------
+    # ---------- STEP 1: Spark ETL ----------
     if not skip_etl:
-        # -- Ingest --
-        if not _stage_done("ingest", resume):
-            log.info("[0/4] HDFS INGESTION — Upload CSV to HDFS")
-            try:
-                ingest_to_hdfs()
-                save_checkpoint("ingest")
-            except Exception as exc:
-                log.error("HDFS ingestion failed: %s", exc, exc_info=True)
-                raise
-
-        # -- ETL --
         if not _stage_done("etl", resume):
-            log.info("[1/4] SPARK ETL PIPELINE — HDFS CSV → HDFS Parquet")
+            log.info("[1/3] SPARK ETL — local CSV → local Parquet")
             try:
                 run_etl()
                 save_checkpoint("etl")
@@ -98,12 +89,12 @@ def run_all(skip_etl=False, resume=False):
                 log.error("ETL failed: %s", exc, exc_info=True)
                 raise
     else:
-        log.info("Skipping HDFS ingestion + ETL (--skip-etl flag set)")
+        log.info("Skipping Spark ETL (--skip-etl flag set)")
 
     # ---------- DETECTION 1: Wash Trades ----------
     wash_alerts = pd.DataFrame()
     if not _stage_done("detect_wash", resume):
-        log.info("[2/4] WASH TRADE DETECTION")
+        log.info("[2/3] WASH TRADE DETECTION")
         try:
             wash_alerts = detect_wash_trades()
             save_checkpoint("detect_wash", {"count": len(wash_alerts)})
@@ -116,7 +107,7 @@ def run_all(skip_etl=False, resume=False):
     # ---------- DETECTION 2: Pump & Dump ----------
     pd_alerts = pd.DataFrame()
     if not _stage_done("detect_pd", resume):
-        log.info("[3/4] PUMP & DUMP DETECTION")
+        log.info("[3/3] PUMP & DUMP DETECTION")
         try:
             pd_alerts = detect_pump_and_dump()
             save_checkpoint("detect_pd", {"count": len(pd_alerts)})
@@ -124,18 +115,6 @@ def run_all(skip_etl=False, resume=False):
             log.error("Pump & dump detection failed: %s", exc, exc_info=True)
     else:
         pd_alerts = _reload_alerts(cfg["alerts_pump_dump"])
-
-    # ---------- DETECTION 3: Spoofing ----------
-    spoof_alerts = pd.DataFrame()
-    if not _stage_done("detect_spoof", resume):
-        log.info("[4/4] SPOOFING DETECTION")
-        try:
-            spoof_alerts = detect_spoofing()
-            save_checkpoint("detect_spoof", {"count": len(spoof_alerts)})
-        except Exception as exc:
-            log.error("Spoofing detection failed: %s", exc, exc_info=True)
-    else:
-        spoof_alerts = _reload_alerts(cfg["alerts_spoofing"])
 
     # ---------- COMBINE ALL ALERTS ----------
     log.info("COMBINING ALL ALERTS")
@@ -146,43 +125,40 @@ def run_all(skip_etl=False, resume=False):
     all_frames = []
 
     if not wash_alerts.empty:
-        all_frames.append(wash_alerts[["alert_type", "severity", "detected_at"]].assign(
-            details=wash_alerts.apply(
-                lambda r: f"Trader {r['trader_id']} | {r['symbol']} | "
-                          f"Price {r['price']} | Qty {r['total_quantity']}",
+        base_cols = ["alert_type", "severity", "detected_at"]
+        available = [c for c in base_cols if c in wash_alerts.columns]
+        frame = wash_alerts[available].copy()
+        if "trader_id" in wash_alerts.columns and "symbol" in wash_alerts.columns:
+            frame["details"] = wash_alerts.apply(
+                lambda r: f"Trader {r.get('trader_id','?')} | {r.get('symbol','?')} | "
+                          f"Price {r.get('price','?')} | Qty {r.get('total_quantity','?')}",
                 axis=1
             )
-        ))
+        all_frames.append(frame)
 
     if not pd_alerts.empty:
-        all_frames.append(pd_alerts[["alert_type", "severity", "detected_at"]].assign(
-            details=pd_alerts.apply(
-                lambda r: f"{r['symbol']} | {r['window_start']} | "
-                          f"Price Δ {r['price_change_pct']}% | "
-                          f"Buy Vol {r['buy_volume']} vs Sell Vol {r['sell_volume']}",
+        base_cols = ["alert_type", "severity", "detected_at"]
+        available = [c for c in base_cols if c in pd_alerts.columns]
+        frame = pd_alerts[available].copy()
+        if "symbol" in pd_alerts.columns:
+            frame["details"] = pd_alerts.apply(
+                lambda r: f"{r.get('symbol','?')} | {r.get('window_start','?')} | "
+                          f"Price Δ {r.get('price_change_pct','?')}% | "
+                          f"Buy Vol {r.get('buy_volume','?')} vs Sell Vol {r.get('sell_volume','?')}",
                 axis=1
             )
-        ))
-
-    if not spoof_alerts.empty:
-        all_frames.append(spoof_alerts[["alert_type", "severity", "detected_at"]].assign(
-            details=spoof_alerts.apply(
-                lambda r: f"Trader {r['trader_id']} | {r['symbols']} | "
-                          f"Cancel Rate {r['cancel_rate']*100:.1f}% | "
-                          f"Size Ratio {r['size_ratio']}x",
-                axis=1
-            )
-        ))
+        all_frames.append(frame)
 
     if all_frames:
         combined = pd.concat(all_frames, ignore_index=True)
         safe_write_csv(combined, combined_path, logger=log)
 
         log.info("Total alerts generated: %d", len(combined))
-        log.info("CRITICAL: %d  |  HIGH: %d  |  MEDIUM: %d",
-                 len(combined[combined["severity"] == "CRITICAL"]),
-                 len(combined[combined["severity"] == "HIGH"]),
-                 len(combined[combined["severity"] == "MEDIUM"]))
+        if "severity" in combined.columns:
+            log.info("CRITICAL: %d  |  HIGH: %d  |  MEDIUM: %d",
+                     len(combined[combined["severity"] == "CRITICAL"]),
+                     len(combined[combined["severity"] == "HIGH"]),
+                     len(combined[combined["severity"] == "MEDIUM"]))
         log.info("Saved to: %s", combined_path)
     else:
         log.info("No alerts generated. All clear!")
@@ -194,8 +170,8 @@ def run_all(skip_etl=False, resume=False):
     log.info("=" * 60)
 
     # Stop the shared Spark session
-    from pyspark.sql import SparkSession
     try:
+        from pyspark.sql import SparkSession
         SparkSession.builder.getOrCreate().stop()
         log.info("Spark session stopped.")
     except Exception:

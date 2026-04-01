@@ -38,3 +38,11 @@ dead_letter/
 # Alert CSVs are committed so the dashboard works on GitHub/Streamlit Cloud.
 # If you prefer NOT to track them, uncomment the next line:
 # alerts/
+
+# Memory files
+CLAUDE.md
+MEMORY.md
+
+# ---------- Spark / Hadoop runtime ----------
+derby.log
+metastore_db/

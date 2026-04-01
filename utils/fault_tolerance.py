@@ -4,11 +4,12 @@ LOGGING & FAULT-TOLERANCE UTILITIES
 Centralised helpers used by every module in the pipeline.
 
 Provides:
-  - get_logger()       → rotating file + console logger (replaces print())
-  - retry()            → decorator with exponential back-off
-  - validate_trade()   → row-level data-quality check
+  - get_logger()        → rotating file + console logger (replaces print())
+  - retry()             → decorator with exponential back-off
+  - validate_trade()    → row-level data-quality check
   - write_dead_letter() → persists rejected rows for auditing
-  - safe_write_csv()   → atomic / idempotent CSV writer
+  - safe_write_csv()    → atomic / idempotent CSV writer
+  - save_checkpoint() / load_checkpoint() / clear_checkpoints()
 """
 
 import logging
@@ -116,14 +117,27 @@ def retry(max_retries: int = 3, base_delay: float = 1.0, backoff_factor: float =
 # ============================================================
 #  3.  TRADE DATA VALIDATION
 # ============================================================
+
+# Fields that MUST be present and non-empty in every row.
+# trader_id is intentionally excluded — Binance public data has no trader identity.
+# Synthetic data (generate_trades.py) includes trader_id and it will be validated
+# if present, but its absence is not an error.
 REQUIRED_FIELDS = [
     "trade_id", "timestamp", "symbol", "price",
-    "quantity", "side", "trader_id", "order_id", "event_type",
+    "quantity", "side", "order_id", "event_type",
 ]
 
-VALID_SIDES = {"BUY", "SELL"}
-VALID_EVENTS = {"TRADE", "WASH", "PUMP", "DUMP", "CANCELLED"}
+# trader_id is optional — present in synthetic data, absent in real Binance data
+OPTIONAL_FIELDS = ["trader_id"]
+
+VALID_SIDES   = {"BUY", "SELL"}
 VALID_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+
+# Real Binance data only produces TRADE events.
+# PUMP / DUMP are injected by generate_trades.py for synthetic dev/testing only.
+# WASH / CANCELLED have been removed — Binance public API never emits these,
+# and spoofing detection (which needed CANCELLED) has been dropped.
+VALID_EVENTS = {"TRADE", "PUMP", "DUMP", "WASH"}
 
 
 def validate_trade(row: dict) -> tuple[bool, str]:
@@ -131,8 +145,11 @@ def validate_trade(row: dict) -> tuple[bool, str]:
     Validate a single trade row.
 
     Returns (True, "") on success, (False, reason) on failure.
+
+    trader_id is optional: real Binance aggTrades have no trader identity.
+    All other 8 fields are required.
     """
-    # Missing fields
+    # Check required fields
     for field in REQUIRED_FIELDS:
         if field not in row or row[field] is None or str(row[field]).strip() == "":
             return False, f"missing_field:{field}"
@@ -145,15 +162,15 @@ def validate_trade(row: dict) -> tuple[bool, str]:
     except (ValueError, TypeError):
         return False, f"invalid_price:{row['price']}"
 
-    # Quantity must be positive integer
+    # Quantity must be positive
     try:
-        qty = int(float(row["quantity"]))
+        qty = float(row["quantity"])
         if qty <= 0:
             return False, f"non_positive_quantity:{qty}"
     except (ValueError, TypeError):
         return False, f"invalid_quantity:{row['quantity']}"
 
-    # Timestamp must parse
+    # Timestamp must parse as ISO-8601
     try:
         ts = str(row["timestamp"])
         datetime.fromisoformat(ts)
@@ -182,7 +199,8 @@ DLQ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.makedirs(DLQ_DIR, exist_ok=True)
 
 DLQ_FILE = os.path.join(DLQ_DIR, "rejected_trades.csv")
-DLQ_FIELDNAMES = REQUIRED_FIELDS + ["rejection_reason", "rejected_at"]
+# trader_id included in DLQ schema so synthetic-data rejections are fully captured
+DLQ_FIELDNAMES = REQUIRED_FIELDS + OPTIONAL_FIELDS + ["rejection_reason", "rejected_at"]
 
 
 def write_dead_letter(row: dict, reason: str):

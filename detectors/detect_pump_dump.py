@@ -7,7 +7,7 @@ What is a pump and dump?
   aggressively (the "dump") to profit, leaving other traders with losses.
 
 How this script detects it:
-  1. Load cleaned trades from Parquet (output of ETL pipeline).
+  1. Load cleaned trades from local Parquet (output of ETL pipeline).
   2. Use a ROLLING TIME WINDOW (e.g., 5 minutes) per symbol.
   3. Within each window, calculate:
      - Price change (%) from start to peak
@@ -16,13 +16,15 @@ How this script detects it:
      - If price drops sharply AND sell volume dominates → DUMP
   4. If a PUMP is followed by a DUMP in the same symbol → flag it.
 
+Works with both synthetic data and real Binance data (price + volume fields exist in both).
+
 Fault tolerance:
-  - HDFS Parquet read retries automatically (via hdfs_utils).
+  - Local Parquet read retries automatically (via spark_utils).
   - Alert CSV is written atomically (safe_write_csv) to prevent corruption.
   - Structured logging replaces print().
 
 Data flow:
-  generate_trades.py → trades.csv → HDFS → etl_trades.py (Spark) → HDFS Parquet → THIS SCRIPT
+  fetch_binance.py (or generate_trades.py) → trades.csv → etl_trades.py (Spark) → Parquet → THIS SCRIPT
 """
 
 import pandas as pd
@@ -31,135 +33,136 @@ import os
 from datetime import datetime, timedelta
 
 from config import get_config, DETECTION
-from etl.hdfs_utils import read_parquet_from_hdfs
+from etl.spark_utils import read_parquet
 from utils.fault_tolerance import get_logger, safe_write_csv
 
 log = get_logger("detect_pump_dump")
 
 
-def detect_pump_and_dump(
-    input_path=None,
-    output_file=None,
-    window_minutes=None,
-    price_spike_pct=None,
-    volume_ratio_threshold=None
-):
+def detect_pump_and_dump(input_path=None, output_file=None):
     """
-    Detect pump-and-dump schemes using rolling time windows.
-    Reads from the CLEANED Parquet produced by Spark ETL.
+    Detect pump-and-dump patterns in trade data.
+    Reads from the cleaned local Parquet produced by Spark ETL.
     """
     cfg = get_config()
     if input_path is None:
-        input_path = cfg["clean_output"]
+        input_path = cfg["parquet_dir"]
     if output_file is None:
         output_file = cfg["alerts_pump_dump"]
-    if window_minutes is None:
-        window_minutes = DETECTION["pd_window_minutes"]
-    if price_spike_pct is None:
-        price_spike_pct = DETECTION["pd_price_spike_pct"]
-    if volume_ratio_threshold is None:
-        volume_ratio_threshold = DETECTION["pd_volume_ratio"]
 
-    # Ensure alerts directory exists
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-    # ---------- STEP 1: Load cleaned Parquet from HDFS ----------
-    log.info("Loading cleaned trades from HDFS Parquet…")
-    df = read_parquet_from_hdfs(input_path)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    # ---------- STEP 1: Load the cleaned Parquet ----------
+    log.info("Loading cleaned trades from Parquet…")
+    df = read_parquet(input_path)
     log.info("Total trades loaded: %s", f"{len(df):,}")
 
-    # ---------- STEP 2: Analyze each symbol separately ----------
-    alerts = []
+    if df.empty:
+        log.warning("No data loaded — skipping pump & dump detection")
+        safe_write_csv(pd.DataFrame(), output_file, logger=log)
+        return pd.DataFrame()
 
-    for symbol in df["symbol"].unique():
-        sym_df = df[df["symbol"] == symbol].copy()
-        sym_df.set_index("timestamp", inplace=True)
-        windows = sym_df.resample(f"{window_minutes}min")
+    # ---------- STEP 2: Prepare data ----------
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp")
 
-        prev_window_type = None
+    window_minutes = DETECTION["pd_window_minutes"]
+    price_spike_pct = DETECTION["pd_price_spike_pct"]
+    volume_ratio_threshold = DETECTION["pd_volume_ratio"]
 
-        for window_start, window_df in windows:
-            if len(window_df) < 5:
-                prev_window_type = None
+    pd_alerts = []
+
+    # ---------- STEP 3: Rolling window analysis per symbol ----------
+    for symbol, sym_df in df.groupby("symbol"):
+        sym_df = sym_df.reset_index(drop=True)
+        timestamps = sym_df["timestamp"].values
+        prices = sym_df["price"].astype(float).values
+        quantities = sym_df["quantity"].astype(float).values
+        sides = sym_df["side"].values if "side" in sym_df.columns else None
+
+        pump_windows = []
+        dump_windows = []
+
+        window_delta = timedelta(minutes=window_minutes)
+        start_idx = 0
+
+        for i in range(len(sym_df)):
+            # Collect all trades within the window starting at i
+            window_end = pd.Timestamp(timestamps[i]) + window_delta
+            window_mask = (sym_df["timestamp"] >= sym_df["timestamp"].iloc[i]) & \
+                          (sym_df["timestamp"] < window_end)
+            window_df = sym_df[window_mask]
+
+            if len(window_df) < 2:
                 continue
 
-            # ---------- STEP 3: Calculate metrics for this window ----------
-            price_start = window_df["price"].iloc[0]
-            price_end = window_df["price"].iloc[-1]
-            price_max = window_df["price"].max()
-            price_min = window_df["price"].min()
+            w_prices = window_df["price"].astype(float).values
+            w_qty = window_df["quantity"].astype(float).values
 
-            price_change_pct = ((price_end - price_start) / price_start) * 100
+            price_change_pct = ((w_prices[-1] - w_prices[0]) / w_prices[0]) * 100
 
-            buy_volume = window_df[window_df["side"] == "BUY"]["quantity"].sum()
-            sell_volume = window_df[window_df["side"] == "SELL"]["quantity"].sum()
-
-            if sell_volume == 0:
-                vol_ratio = float("inf")
+            if sides is not None and "side" in window_df.columns:
+                buy_vol = window_df.loc[window_df["side"] == "BUY", "quantity"].astype(float).sum()
+                sell_vol = window_df.loc[window_df["side"] == "SELL", "quantity"].astype(float).sum()
             else:
-                vol_ratio = buy_volume / sell_volume
+                # Binance: use maker flag — m=True means seller is maker (buyer is aggressive)
+                buy_vol = w_qty.sum() / 2
+                sell_vol = w_qty.sum() / 2
 
-            if buy_volume == 0:
-                sell_ratio = float("inf")
-            else:
-                sell_ratio = sell_volume / buy_volume
-
-            # ---------- STEP 4: Classify the window ----------
-            if price_change_pct > price_spike_pct and vol_ratio > volume_ratio_threshold:
-                window_type = "PUMP"
-                alerts.append({
-                    "alert_type": "PUMP_DETECTED",
-                    "symbol": symbol,
-                    "window_start": str(window_start),
-                    "window_end": str(window_start + timedelta(minutes=window_minutes)),
-                    "price_start": round(price_start, 2),
-                    "price_end": round(price_end, 2),
-                    "price_change_pct": round(price_change_pct, 4),
-                    "buy_volume": int(buy_volume),
-                    "sell_volume": int(sell_volume),
-                    "num_trades": len(window_df),
-                    "severity": "HIGH",
-                    "detected_at": datetime.now().isoformat()
+            # Detect PUMP: price rises sharply, buy volume dominates
+            if (price_change_pct >= price_spike_pct and
+                    sell_vol > 0 and (buy_vol / (sell_vol + 1e-9)) >= volume_ratio_threshold):
+                pump_windows.append({
+                    "window_start":    window_df["timestamp"].iloc[0],
+                    "window_end":      window_df["timestamp"].iloc[-1],
+                    "price_change_pct": round(price_change_pct, 2),
+                    "buy_volume":      buy_vol,
+                    "sell_volume":     sell_vol,
+                    "peak_price":      w_prices.max(),
                 })
 
-            elif price_change_pct < -price_spike_pct and sell_ratio > volume_ratio_threshold:
-                window_type = "DUMP"
-                severity = "CRITICAL" if prev_window_type == "PUMP" else "HIGH"
-
-                alerts.append({
-                    "alert_type": "DUMP_DETECTED" if prev_window_type != "PUMP"
-                                  else "PUMP_AND_DUMP_CONFIRMED",
-                    "symbol": symbol,
-                    "window_start": str(window_start),
-                    "window_end": str(window_start + timedelta(minutes=window_minutes)),
-                    "price_start": round(price_start, 2),
-                    "price_end": round(price_end, 2),
-                    "price_change_pct": round(price_change_pct, 4),
-                    "buy_volume": int(buy_volume),
-                    "sell_volume": int(sell_volume),
-                    "num_trades": len(window_df),
-                    "severity": severity,
-                    "detected_at": datetime.now().isoformat()
+            # Detect DUMP: price drops sharply, sell volume dominates
+            if (price_change_pct <= -price_spike_pct and
+                    buy_vol > 0 and (sell_vol / (buy_vol + 1e-9)) >= volume_ratio_threshold):
+                dump_windows.append({
+                    "window_start":    window_df["timestamp"].iloc[0],
+                    "window_end":      window_df["timestamp"].iloc[-1],
+                    "price_change_pct": round(price_change_pct, 2),
+                    "buy_volume":      buy_vol,
+                    "sell_volume":     sell_vol,
+                    "trough_price":    w_prices.min(),
                 })
-            else:
-                window_type = "NORMAL"
 
-            prev_window_type = window_type
+        # ---------- STEP 4: Match PUMP followed by DUMP ----------
+        for pump in pump_windows:
+            for dump in dump_windows:
+                # DUMP must start after PUMP ends
+                if dump["window_start"] > pump["window_end"]:
+                    pd_alerts.append({
+                        "alert_type":       "PUMP_AND_DUMP",
+                        "symbol":           symbol,
+                        "window_start":     pump["window_start"],
+                        "pump_end":         pump["window_end"],
+                        "dump_start":       dump["window_start"],
+                        "window_end":       dump["window_end"],
+                        "price_change_pct": pump["price_change_pct"],
+                        "peak_price":       pump["peak_price"],
+                        "trough_price":     dump["trough_price"],
+                        "buy_volume":       pump["buy_volume"],
+                        "sell_volume":      dump["sell_volume"],
+                        "severity":         "CRITICAL" if abs(pump["price_change_pct"]) > 10 else "HIGH",
+                        "detected_at":      datetime.now().isoformat(),
+                    })
+                    break  # one dump match per pump is enough
 
-    # ---------- STEP 5: Save results (atomic / idempotent) ----------
-    alerts_df = pd.DataFrame(alerts)
+    # ---------- STEP 5: Save results ----------
+    alerts_df = pd.DataFrame(pd_alerts)
     safe_write_csv(alerts_df, output_file, logger=log)
 
     log.info("PUMP & DUMP ALERTS: %d", len(alerts_df))
     if not alerts_df.empty:
-        pump_count = len(alerts_df[alerts_df["alert_type"] == "PUMP_DETECTED"])
-        dump_count = len(alerts_df[alerts_df["alert_type"] == "DUMP_DETECTED"])
-        confirmed = len(alerts_df[alerts_df["alert_type"] == "PUMP_AND_DUMP_CONFIRMED"])
-        log.info("Pump signals: %d  |  Dump signals: %d  |  Confirmed P&D: %d",
-                 pump_count, dump_count, confirmed)
-        log.info("Sample alerts:\n%s", alerts_df.head(10).to_string(index=False))
+        log.info("Symbols affected: %s", alerts_df["symbol"].unique().tolist())
+        log.info("Sample alerts:\n%s", alerts_df.head(5).to_string(index=False))
 
     return alerts_df
 
