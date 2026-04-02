@@ -1,0 +1,79 @@
+# ============================================================
+#  Phase 2 — Kafka KRaft Single-Broker (No Zookeeper)
+# ============================================================
+#
+#  Starts a single Kafka broker in KRaft mode (Kafka 3.7+).
+#  KRaft = Kafka Raft — Kafka manages its own metadata without Zookeeper.
+#
+#  Services:
+#    kafka   — single broker, KRaft mode, exposed on localhost:9092
+#
+#  Usage:
+#    docker compose up -d          # start broker in background
+#    docker compose down           # stop and remove containers
+#    docker compose logs -f kafka  # tail broker logs
+#
+#  Topic auto-creation is ON (auto.create.topics.enable=true).
+#  The 'market-trades' topic is created automatically on first produce.
+#
+#  To manually create the topic:
+#    docker exec -it kafka kafka-topics.sh \
+#      --bootstrap-server localhost:9092 \
+#      --create --topic market-trades \
+#      --partitions 3 --replication-factor 1
+#
+#  To inspect messages:
+#    docker exec -it kafka kafka-console-consumer.sh \
+#      --bootstrap-server localhost:9092 \
+#      --topic market-trades --from-beginning
+# ============================================================
+
+services:
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"       # external (host) access
+      - "9093:9093"       # KRaft controller port (internal)
+    environment:
+      # ---- KRaft identity ----
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+
+      # ---- Listeners ----
+      # PLAINTEXT  → broker-to-broker + Spark Structured Streaming (inside Docker network)
+      # EXTERNAL   → host machine access (localhost:9092)
+      # CONTROLLER → KRaft controller traffic
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://kafka:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # ---- Performance & reliability ----
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1       # single broker → RF=1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 1                    # keep 1h of data (dev mode)
+      KAFKA_LOG_SEGMENT_BYTES: 10485760               # 10 MB segments
+      KAFKA_NUM_PARTITIONS: 3                         # 3 partitions for market-trades topic
+
+      # ---- Cluster ID (KRaft requires a stable UUID) ----
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  kafka_data:
+    driver: local

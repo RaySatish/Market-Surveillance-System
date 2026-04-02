@@ -17,6 +17,7 @@ Runs fully on your local machine. Designed to scale to **AWS EMR + S3** with a s
 - [Fault Tolerance](#fault-tolerance)
 - [Getting Started](#getting-started)
 - [Running the Pipeline](#running-the-pipeline)
+- [Streaming Mode (Phase 2)](#streaming-mode-phase-2)
 - [Dashboard](#dashboard)
 - [Detection Algorithms](#detection-algorithms)
 - [Configuration](#configuration)
@@ -34,6 +35,8 @@ Runs fully on your local machine. Designed to scale to **AWS EMR + S3** with a s
 ---
 
 ## Architecture
+
+### Phase 1 — Batch Pipeline
 
 ```
 Binance REST API (fetch_binance.py)
@@ -63,8 +66,30 @@ Binance REST API (fetch_binance.py)
           dashboard.py (Streamlit)
 ```
 
+### Phase 2 — Streaming Pipeline (Kafka + Spark Structured Streaming)
+
+```
+Binance WebSocket (kafka_producer.py)
+        │
+        ▼
+  Kafka topic: market-trades
+  (Docker KRaft — single broker, no Zookeeper)
+        │
+        ▼
+┌───────────────────────────┐    ┌──────────────────────────────┐
+│ spark_streaming_wash.py   │    │ spark_streaming_pump_dump.py │
+│ (micro-batch Z-score)     │    │ (micro-batch price windows)  │
+└────────────┬──────────────┘    └───────────────┬──────────────┘
+             │                                   │
+             ▼                                   ▼
+  streaming_wash_alerts.csv       streaming_pump_dump_alerts.csv
+                    │                   │
+                    ▼                   ▼
+          stream_alerts_dashboard.py (Streamlit, auto-refresh)
+```
+
 **Two deployment modes** — controlled by `MODE` in `config.py`:
-- **`"local"` (Phase 1, now):** Spark `local[*]`, local filesystem paths
+- **`"local"` (Phase 1 & 2, now):** Spark `local[*]`, local filesystem paths
 - **`"aws"` (Phase 3):** EMR + S3 — same code, just change `MODE`
 
 ---
@@ -76,33 +101,43 @@ Market-Surveillance-for-Trade-Abuse-Detection/
 │
 ├── config.py                   # Central config: all paths, thresholds, MODE switch
 ├── run_all_detections.py       # Orchestrator: ETL → wash → pump&dump
-├── dashboard.py                # Streamlit dashboard (no Spark needed)
+├── dashboard.py                # Batch Streamlit dashboard (no Spark needed)
+├── docker-compose.yml          # KRaft Kafka broker (Phase 2)
 ├── requirements.txt
 │
 ├── ingestion/
 │   ├── fetch_binance.py        # Pulls real data from Binance aggTrades REST API
 │   ├── generate_trades.py      # Generates synthetic data (dev/testing only)
-│   ├── ingest_to_hdfs.py       # Legacy HDFS ingestion (Phase 1 original)
-│   └── stream_binance.py       # Phase 2: Binance WebSocket → Kafka streaming
+│   ├── ingest_to_hdfs.py       # Legacy HDFS ingestion (unused)
+│   └── stream_binance.py       # Legacy WebSocket stub (unused)
 │
 ├── etl/
 │   ├── etl_trades.py           # Spark ETL: CSV → cleaned Parquet
-│   ├── spark_utils.py          # SparkSession factory
-│   └── hdfs_utils.py           # Parquet reader (pandas bridge)
+│   ├── spark_utils.py          # SparkSession factory + Parquet reader
+│   └── hdfs_utils.py           # Legacy HDFS utilities (unused)
 │
 ├── detectors/
-│   ├── detect_wash_trades.py   # Z-score volume anomaly detection
-│   └── detect_pump_dump.py     # Price spike + dump pattern detection
+│   ├── detect_wash_trades.py   # Batch: Z-score volume anomaly detection
+│   └── detect_pump_dump.py     # Batch: price spike + dump pattern detection
+│
+├── streaming/                  # Phase 2: Kafka + Spark Structured Streaming
+│   ├── __init__.py
+│   ├── kafka_producer.py       # Binance WebSocket → Kafka topic
+│   ├── spark_streaming_wash.py         # Structured Streaming wash detector
+│   ├── spark_streaming_pump_dump.py    # Structured Streaming P&D detector
+│   ├── run_streaming_pipeline.py       # Orchestrator: start producer + consumers
+│   └── stream_alerts_dashboard.py      # Streaming Streamlit dashboard (auto-refresh)
 │
 ├── utils/
 │   └── fault_tolerance.py      # Logging, retry, validation, safe writes, checkpoints
 │
-├── alerts/                     # Alert CSVs (committed — dashboard works without running pipeline)
+├── alerts/                     # Batch alert CSVs (committed — dashboard works without pipeline)
 │   ├── alerts_wash.csv
 │   ├── alerts_pump_dump.csv
-│   └── all_alerts.csv
+│   ├── all_alerts.csv
+│   ├── streaming_wash_alerts.csv       # Streaming alert output (Phase 2)
+│   └── streaming_pump_dump_alerts.csv  # Streaming alert output (Phase 2)
 │
-├── streaming/                  # Phase 2: Kafka consumer + Spark Structured Streaming
 ├── models/                     # ML model artefacts (future)
 ├── tests/                      # Unit tests
 ├── data/                       # Parquet output (gitignored)
@@ -117,12 +152,13 @@ Market-Surveillance-for-Trade-Abuse-Detection/
 
 | Layer | Technology |
 |---|---|
-| **Data Source** | Binance REST API (`/api/v3/aggTrades`) |
-| **Big Data Processing** | Apache Spark (PySpark) |
-| **Storage** | Local filesystem (Phase 1) → AWS S3 (Phase 3) |
-| **Detection Logic** | Pandas (post-Spark, in-memory) |
-| **Dashboard** | Streamlit |
-| **Streaming (Phase 2)** | Kafka (Docker KRaft) + Spark Structured Streaming |
+| **Data Source** | Binance REST API (`/api/v3/aggTrades`) + WebSocket (streaming) |
+| **Big Data Processing** | Apache Spark (PySpark) — batch ETL + Structured Streaming |
+| **Message Broker** | Apache Kafka (Docker KRaft — no Zookeeper) |
+| **Storage** | Local filesystem (Phase 1 & 2) → AWS S3 (Phase 3) |
+| **Detection Logic** | Pandas (batch) + Spark Structured Streaming (streaming) |
+| **Dashboard** | Streamlit (batch: `dashboard.py`; streaming: `stream_alerts_dashboard.py`) |
+| **Containerisation** | Docker Compose (Kafka broker) |
 | **Cloud (Phase 3)** | AWS EMR + S3 |
 | **Language** | Python 3.10+ |
 
@@ -149,6 +185,7 @@ Every pipeline stage follows the same pattern (implemented in `utils/fault_toler
 - Python 3.10+
 - Apache Spark / PySpark installed separately (not in `requirements.txt`)
 - Java 8 or 11 (required by Spark)
+- Docker Desktop (required for Phase 2 Kafka)
 
 ### Install dependencies
 
@@ -179,6 +216,8 @@ Generates ~300K synthetic records with injected wash and pump&dump patterns. Not
 
 ## Running the Pipeline
 
+### Batch Pipeline (Phase 1)
+
 ```bash
 # Full run: ETL → wash detection → pump&dump detection
 python run_all_detections.py
@@ -190,7 +229,7 @@ python run_all_detections.py --skip-etl
 python run_all_detections.py --resume
 ```
 
-### Run individual detectors
+#### Run individual detectors
 
 ```bash
 python detectors/detect_wash_trades.py
@@ -199,20 +238,81 @@ python detectors/detect_pump_dump.py
 
 ---
 
+## Streaming Mode (Phase 2)
+
+Phase 2 adds near-real-time detection via Kafka and Spark Structured Streaming. Trades stream from Binance WebSocket → Kafka → Spark micro-batches → streaming alert CSVs → live Streamlit dashboard.
+
+### Start Kafka
+
+```bash
+docker compose up -d
+```
+
+Starts a single KRaft Kafka broker (no Zookeeper) on `localhost:9092`. The `market-trades` topic is auto-created on first message.
+
+### Run the streaming pipeline
+
+```bash
+# Full streaming run: producer + both detectors
+python streaming/run_streaming_pipeline.py
+
+# Test mode: inject synthetic trades instead of live WebSocket
+python streaming/run_streaming_pipeline.py --test
+
+# Producer only (no detectors)
+python streaming/run_streaming_pipeline.py --producer-only
+
+# Consumers only (detectors only, no producer)
+python streaming/run_streaming_pipeline.py --consumers-only
+```
+
+### Streaming dashboard
+
+```bash
+streamlit run streaming/stream_alerts_dashboard.py
+```
+
+The streaming dashboard auto-refreshes every 5–60 seconds (configurable via sidebar). It reads from `alerts/streaming_wash_alerts.csv` and `alerts/streaming_pump_dump_alerts.csv` — no Spark dependency.
+
+### Stop Kafka
+
+```bash
+docker compose down
+```
+
+---
+
 ## Dashboard
+
+### Batch Dashboard
 
 ```bash
 streamlit run dashboard.py
 ```
 
-The dashboard reads directly from `trades.csv` and `alerts/*.csv` — **no Spark or HDFS required**. The `alerts/` directory is committed to the repo so the dashboard works immediately without running the pipeline.
+Reads directly from `trades.csv` and `alerts/*.csv` — **no Spark or HDFS required**. The `alerts/` directory is committed to the repo so the dashboard works immediately without running the pipeline.
 
-**Dashboard sections:**
-- **Alert Overview** — total alerts, breakdown by type and severity
-- **Severity Distribution** — pie and bar charts
-- **Price Charts** — per-symbol candlestick-style charts with abuse markers overlaid
-- **Volume Analysis** — volume anomaly visualization
-- **Trader Risk Scoreboard** — weighted risk score per trader (wash×3, pump×5, dump×5)
+**Sections:**
+- **Alert Overview** — total alerts, breakdown by type and severity, data freshness window
+- **Alert Timeline** — alerts per 1-minute bin over time
+- **Wash Trade Alerts** — severity distribution, Z-score by symbol, raw alert table
+- **Pump & Dump Alerts** — severity distribution, pump vs dump scatter, raw alert table
+- **Volume Analysis** — buy vs sell volume by symbol + volume over time
+- **Symbol Risk Summary** — weighted risk score per symbol (CRITICAL×3 + HIGH×2 + MEDIUM×1)
+
+### Streaming Dashboard
+
+```bash
+streamlit run streaming/stream_alerts_dashboard.py
+```
+
+**Sections:**
+- **Pipeline Status** — whether streaming alert files are present (live indicator)
+- **Overview Metrics** — total alerts, wash count, P&D count, critical count, symbols flagged
+- **Alert Timeline** — alerts per 1-minute bin, color-coded by type
+- **Wash Trade Alerts** — severity pie, avg Z-score by symbol, raw table
+- **Pump & Dump Alerts** — severity pie, pump% vs dump% scatter, raw table
+- **Symbol Risk Summary** — per-symbol weighted risk score
 
 ---
 
@@ -261,12 +361,6 @@ DETECTION = {
 ---
 
 ## Future Roadmap
-
-### Phase 2 — Local Streaming (Kafka)
-- Binance WebSocket → Kafka topic (Docker KRaft, no Zookeeper)
-- Spark Structured Streaming reads from Kafka
-- Same detectors, now running on micro-batches
-- Run: `python ingestion/stream_binance.py --live`
 
 ### Phase 3 — AWS Cloud Scale
 - Change `MODE = "aws"` in `config.py`
