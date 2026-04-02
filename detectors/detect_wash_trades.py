@@ -40,7 +40,7 @@ def detect_wash_trades(input_path=None, output_file=None):
     Detect wash trades from local Parquet (output of ETL pipeline).
 
     If trader_id is available (synthetic data): group-based detection.
-    If trader_id is 'binance_agg' (real Binance data): statistical Z-score detection.
+    If trader_id is absent/single-value (real Binance data): statistical Z-score detection.
     """
     cfg = get_config()
     if input_path is None:
@@ -48,15 +48,12 @@ def detect_wash_trades(input_path=None, output_file=None):
     if output_file is None:
         output_file = cfg["alerts_wash"]
 
-    # Ensure alerts directory exists
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-    # ---------- STEP 1: Load the cleaned Parquet ----------
     log.info("Loading cleaned trades from Parquet…")
     df = read_parquet(input_path)
     log.info("Total trades loaded: %s", f"{len(df):,}")
 
-    # Determine detection mode
     is_real_binance = (
         "trader_id" not in df.columns
         or df["trader_id"].nunique() <= 1
@@ -68,7 +65,6 @@ def detect_wash_trades(input_path=None, output_file=None):
     else:
         alerts_df = _detect_group_based(df)
 
-    # ---------- STEP 4: Save results (atomic / idempotent) ----------
     safe_write_csv(alerts_df, output_file, logger=log)
 
     log.info("WASH TRADE ALERTS: %d", len(alerts_df))
@@ -110,6 +106,7 @@ def _detect_group_based(df: pd.DataFrame) -> pd.DataFrame:
 def _detect_statistical(df: pd.DataFrame) -> pd.DataFrame:
     """
     Real Binance data mode: Z-score on rolling trade volume per symbol.
+    Resample to 1-second buckets first to avoid duplicate-index issues.
     Flags time windows where volume is anomalously high (potential coordinated wash).
     """
     log.info("Using statistical Z-score wash detection (real Binance data mode)")
@@ -129,28 +126,39 @@ def _detect_statistical(df: pd.DataFrame) -> pd.DataFrame:
 
     for symbol, sym_df in df.groupby("symbol"):
         sym_df = sym_df.set_index("timestamp")
-        # Rolling volume (sum of quantity in window)
-        rolling_vol = sym_df["quantity"].rolling(window).sum()
+
+        # Resample to 1-second buckets: sum quantity, take mean price
+        resampled = sym_df.resample("1s").agg(
+            quantity=("quantity", "sum"),
+            price=("price", "mean")
+        ).dropna(subset=["quantity"])
+
+        # Rolling volume over the configured window
+        rolling_vol = resampled["quantity"].rolling(window).sum()
         mean_vol = rolling_vol.mean()
         std_vol = rolling_vol.std()
 
         if std_vol == 0 or pd.isna(std_vol):
+            log.warning("Zero std for %s — skipping", symbol)
             continue
 
         z_scores = (rolling_vol - mean_vol) / std_vol
         flagged = z_scores[z_scores > threshold]
 
         for ts, z in flagged.items():
+            price_val = float(resampled.loc[ts, "price"])
+            vol_val = float(rolling_vol[ts])
+
             wash_alerts.append({
-                "alert_type":  "WASH_TRADE",
-                "trader_id":   "UNKNOWN (Binance public data)",
-                "symbol":      symbol,
-                "timestamp":   ts,
-                "price":       sym_df.loc[ts, "price"] if ts in sym_df.index else None,
-                "total_quantity": rolling_vol[ts],
-                "z_score":     round(z, 2),
-                "severity":    "CRITICAL" if z > threshold * 1.5 else "HIGH",
-                "detected_at": datetime.now().isoformat(),
+                "alert_type":     "WASH_TRADE",
+                "trader_id":      "UNKNOWN (Binance public data)",
+                "symbol":         symbol,
+                "timestamp":      ts,
+                "price":          round(price_val, 2),
+                "total_quantity": round(vol_val, 6),
+                "z_score":        round(float(z), 2),
+                "severity":       "CRITICAL" if float(z) > threshold * 1.5 else "HIGH",
+                "detected_at":    datetime.now().isoformat(),
             })
 
     return pd.DataFrame(wash_alerts)

@@ -96,17 +96,28 @@ def get_config():
 
 
 # Detection thresholds (same for all modes — centralised here, never hardcoded in detectors)
+#
+# TUNING NOTE:
+#   These thresholds control the sensitivity vs. specificity tradeoff.
+#   Lower values → higher recall (catches more suspicious activity, more false positives).
+#   Higher values → higher precision (fewer alerts, but each is more confident).
+#   In a production system, these would be calibrated against labelled historical data.
+#   Current values are tuned for real Binance public data (30–60 min windows).
+#
 DETECTION = {
     # Wash trade — statistical Z-score (no real trader_id from Binance public API)
     # Group-based detection is used only when trader_id is present (synthetic/dev data)
-    "wash_zscore_threshold": 3.0,       # flag windows where volume Z-score > this
-    "wash_rolling_window":   "5min",    # rolling window size for volume baseline
+    "wash_zscore_threshold": 1.8,       # flag 1-second buckets where rolling volume Z-score > this
+                                        # (original: 3.0 — very conservative, misses moderate spikes)
+    "wash_rolling_window":   "2min",    # rolling window size for volume baseline
+                                        # (original: 5min — too wide for short data windows)
 
-    # Pump & dump
-    "pd_window_minutes":   5,
-    "pd_price_spike_pct":  5,
-    "pd_volume_ratio":     3.0,
-
-    # NOTE: Spoofing thresholds removed — detection not possible on Binance public data.
-    # Binance aggTrades API only returns executed trades, never CANCELLED orders.
+    # Pump & dump — resampled 1-min OHLCV windows
+    "pd_window_minutes":   3,           # rolling window size (in 1-min bars) for P&D detection
+                                        # (original: 5 — too wide, dilutes price signals)
+    "pd_price_spike_pct":  0.08,        # minimum % price change to flag as spike
+                                        # (real BTC/ETH: max ~0.25% in 3 min; 0.08% catches real moves)
+                                        # (original: 5.0 → 1.5 → 0.15 → now 0.08 for real-data sensitivity)
+    "pd_volume_ratio":     1.3,         # buy/sell volume imbalance ratio to confirm P&D
+                                        # (original: 3.0 → 1.5 → now 1.3 for real-data sensitivity)
 }

@@ -22,6 +22,20 @@ Fault tolerance:
 """
 
 import os
+
+# ── Spark environment fix ────────────────────────────────────────────────────
+# If SPARK_HOME points to a standalone Spark install (e.g. 3.x), it conflicts
+# with the PySpark 4.x bundled JARs in the venv.  Unset it so PySpark uses
+# its own bundled JARs (the correct approach when installing via pip).
+if "SPARK_HOME" in os.environ:
+    del os.environ["SPARK_HOME"]
+
+# Prefer Java 17 if available (PySpark 4.x requires Java 17+).
+_java17 = "/opt/homebrew/Cellar/openjdk@17/17.0.18/libexec/openjdk.jdk/Contents/Home"
+if os.path.isdir(_java17):
+    os.environ["JAVA_HOME"] = _java17
+# ─────────────────────────────────────────────────────────────────────────────
+
 from pyspark.sql import SparkSession
 
 from config import get_config, MODE
