@@ -3,40 +3,48 @@ PIPELINE CONFIGURATION
 ======================
 Central config that controls WHERE data lives and HOW it's processed.
 
-PHASE 1 (now):  MODE = "local"
+PHASE 1:  MODE = "local"
   - Batch pull from Binance REST API (fetch_binance.py) — real market data
   - Spark reads/writes local filesystem (no HDFS)
   - Alerts written locally (small CSVs from pandas)
   - Detectors: Wash Trade (statistical Z-score), Pump & Dump
 
-PHASE 2 (laptop streaming):  MODE = "local" + Kafka
+PHASE 2:  MODE = "local_streaming"
   - Same local paths; Spark Structured Streaming reads from Kafka topic
   - Kafka runs in Docker (KRaft single-broker, no Zookeeper)
+  - Alerts written to local CSV files via foreachBatch
 
-PHASE 3 (AWS):  MODE = "aws"
-  - Binance REST API → S3; Spark on EMR; same code, just change MODE
+PHASE 3:  MODE = "streaming"
+  - Kafka alert topics replace CSV sinks
+  - alert_consumer.py persists to PostgreSQL (Docker)
+  - Dashboard queries PostgreSQL live
+
+PHASE 4:  MODE = "aws"
+  - Amazon MSK + EMR + RDS + S3 — same code, just config changes
 
 NOTE: Spoofing detection has been permanently removed.
   Binance public aggTrades API does not expose CANCELLED order events.
   Spoofing detection is not possible on real exchange data without
   private order-book access (e.g. exchange co-location feeds).
 
-Just change MODE to "aws" and fill in the AWS settings — everything adapts.
+Just change MODE and everything adapts.
 """
 
 import os
 
 # ============================================================
-#  SWITCH THIS TO "aws" WHEN DEPLOYING TO CLOUD
+#  SWITCH THIS TO CHANGE DEPLOYMENT PHASE
 # ============================================================
-MODE = "local"  # "local" or "aws"
+# Options: "local" (Phase 1), "local_streaming" (Phase 2),
+#          "streaming" (Phase 3), "aws" (Phase 4)
+MODE = "streaming"
 
 # Project root (directory containing this file)
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 # ============================================================
-#  LOCAL SETTINGS (Phase 1 & 2 — laptop, local filesystem)
+#  LOCAL SETTINGS (Phase 1 — batch, local filesystem)
 # ============================================================
 LOCAL = {
     "spark_master": "local[*]",
@@ -61,7 +69,58 @@ LOCAL = {
 
 
 # ============================================================
-#  AWS SETTINGS (Phase 3 — EMR + S3)
+#  LOCAL STREAMING SETTINGS (Phase 2 — Kafka + CSV sinks)
+# ============================================================
+LOCAL_STREAMING = {
+    **LOCAL,  # inherit all local paths
+
+    "spark_master": "local[2]",  # 2 cores for streaming
+
+    # Kafka topics
+    "kafka_bootstrap": "localhost:9092",
+    "kafka_topic":     "market-trades",
+
+    # Streaming checkpoint dirs (Spark Structured Streaming)
+    "checkpoint_wash":      os.path.join(_ROOT, "checkpoints", "streaming_wash"),
+    "checkpoint_pump_dump": os.path.join(_ROOT, "checkpoints", "streaming_pump_dump"),
+}
+
+
+# ============================================================
+#  STREAMING SETTINGS (Phase 3 — Kafka alert topics + PostgreSQL)
+# ============================================================
+STREAMING = {
+    **LOCAL_STREAMING,  # inherit local + streaming paths
+
+    # Kafka alert topics (Phase 3: Spark writes alerts here)
+    "kafka_wash_alerts_topic":  "wash-alerts",
+    "kafka_pd_alerts_topic":    "pump-dump-alerts",
+
+    # PostgreSQL (Docker, Phase 3)
+    "pg_host":     "localhost",
+    "pg_port":     5432,
+    "pg_database": "surveillance",
+    "pg_user":     "surveillance",
+    "pg_password": os.environ.get("PG_PASSWORD", "surveillance_local"),
+
+    # Optional admin credentials used only as a fallback when the configured
+    # `pg_user` role is missing (common when a Docker volume was created
+    # previously with different POSTGRES_USER values).
+    #
+    # For local Docker dev, `postgres` is usually a safe default and may work
+    # with the same password stored in the image's existing cluster.
+    "pg_admin_user": os.environ.get("PG_ADMIN_USER", "postgres"),
+    "pg_admin_password": os.environ.get("PG_ADMIN_PASSWORD", os.environ.get("PG_PASSWORD", "surveillance_local")),
+    "pg_admin_database": os.environ.get("PG_ADMIN_DATABASE", "postgres"),
+
+    # Streaming checkpoint dirs (separate from Phase 2 to avoid conflicts)
+    "checkpoint_wash":      os.path.join(_ROOT, "checkpoints", "phase3_wash"),
+    "checkpoint_pump_dump": os.path.join(_ROOT, "checkpoints", "phase3_pump_dump"),
+}
+
+
+# ============================================================
+#  AWS SETTINGS (Phase 4 — MSK + EMR + RDS + S3)
 # ============================================================
 AWS = {
     "spark_master": "yarn",  # EMR manages Spark via YARN
@@ -79,9 +138,25 @@ AWS = {
     # Binance REST API
     "binance_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
 
-    # Kafka / Kinesis (Phase 3 streaming)
-    "kafka_bootstrap": "your-kafka-broker:9092",
-    "kafka_topic":     "market-trades",
+    # Kafka (Amazon MSK)
+    "kafka_bootstrap":          "your-msk-broker-1:9092,your-msk-broker-2:9092,your-msk-broker-3:9092",
+    "kafka_topic":              "market-trades",
+    "kafka_wash_alerts_topic":  "wash-alerts",
+    "kafka_pd_alerts_topic":    "pump-dump-alerts",
+
+    # PostgreSQL (Amazon RDS)
+    "pg_host":     os.environ.get("RDS_ENDPOINT", "your-rds-endpoint.rds.amazonaws.com"),
+    "pg_port":     5432,
+    "pg_database": "surveillance",
+    "pg_user":     os.environ.get("RDS_USER", "surveillance"),
+    "pg_password": os.environ.get("RDS_PASSWORD", "change-me-in-production"),
+
+    # SNS (Critical alert notifications — Phase 4 only)
+    "sns_critical_topic_arn": os.environ.get("SNS_CRITICAL_ARN", ""),
+
+    # Streaming checkpoint dirs (S3)
+    "checkpoint_wash":      "s3a://your-bucket/market/checkpoints/wash",
+    "checkpoint_pump_dump": "s3a://your-bucket/market/checkpoints/pump_dump",
 }
 
 
@@ -90,9 +165,15 @@ AWS = {
 # ============================================================
 def get_config():
     """Returns the active configuration dict based on MODE."""
-    if MODE == "aws":
-        return AWS
-    return LOCAL
+    configs = {
+        "local":           LOCAL,
+        "local_streaming": LOCAL_STREAMING,
+        "streaming":       STREAMING,
+        "aws":             AWS,
+    }
+    if MODE not in configs:
+        raise ValueError(f"Unknown MODE '{MODE}'. Valid: {list(configs.keys())}")
+    return configs[MODE]
 
 
 # Detection thresholds (same for all modes — centralised here, never hardcoded in detectors)
@@ -107,17 +188,20 @@ def get_config():
 DETECTION = {
     # Wash trade — statistical Z-score (no real trader_id from Binance public API)
     # Group-based detection is used only when trader_id is present (synthetic/dev data)
-    "wash_zscore_threshold": 1.8,       # flag 1-second buckets where rolling volume Z-score > this
-                                        # (original: 3.0 — very conservative, misses moderate spikes)
+    "wash_zscore_threshold": 0.1,       # Z-score threshold for streaming wash detection
+                                        # Tuned for real Binance data: volume variance is tight
+                                        # on major pairs; 0.1 catches natural micro-spikes
+                                        # (history: 3.0 → 0.5 → 0.1)
     "wash_rolling_window":   "2min",    # rolling window size for volume baseline
-                                        # (original: 5min — too wide for short data windows)
 
     # Pump & dump — resampled 1-min OHLCV windows
-    "pd_window_minutes":   3,           # rolling window size (in 1-min bars) for P&D detection
-                                        # (original: 5 — too wide, dilutes price signals)
-    "pd_price_spike_pct":  0.08,        # minimum % price change to flag as spike
-                                        # (real BTC/ETH: max ~0.25% in 3 min; 0.08% catches real moves)
-                                        # (original: 5.0 → 1.5 → 0.15 → now 0.08 for real-data sensitivity)
-    "pd_volume_ratio":     1.3,         # buy/sell volume imbalance ratio to confirm P&D
-                                        # (original: 3.0 → 1.5 → now 1.3 for real-data sensitivity)
+    "pd_window_minutes":   5,           # rolling window size (in 1-min bars) for P&D detection
+                                        # Wider window gives more time for dump to follow pump
+    "pd_price_spike_pct":  0.08,        # minimum % price change to flag as spike (batch)
+    "pd_pump_threshold":   0.001,       # 0.1% rise triggers PUMP in streaming
+    "pd_dump_threshold":  -0.001,       # 0.1% drop triggers DUMP in streaming
+                                        # Real BTC/ETH easily move 0.1% per minute
+                                        # (history: 5.0 → 0.15 → 0.005 → 0.001)
+    "pd_volume_ratio":     1.1,         # volume ratio to confirm P&D phase
+                                        # (history: 3.0 → 1.5 → 1.3 → 1.1)
 }

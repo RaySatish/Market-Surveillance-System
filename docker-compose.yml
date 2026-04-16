@@ -1,31 +1,35 @@
 # ============================================================
 #  Phase 2 — Kafka KRaft Single-Broker (No Zookeeper)
+#  Phase 3 — Adds PostgreSQL 16 for alert persistence
 # ============================================================
 #
-#  Starts a single Kafka broker in KRaft mode (Kafka 3.7+).
-#  KRaft = Kafka Raft — Kafka manages its own metadata without Zookeeper.
-#
 #  Services:
-#    kafka   — single broker, KRaft mode, exposed on localhost:9092
+#    kafka      — single broker, KRaft mode, exposed on localhost:9092
+#    postgres   — PostgreSQL 16, exposed on localhost:5432 (Phase 3+)
 #
 #  Usage:
-#    docker compose up -d          # start broker in background
-#    docker compose down           # stop and remove containers
-#    docker compose logs -f kafka  # tail broker logs
+#    docker compose up -d              # start all services
+#    docker compose down               # stop and remove containers
+#    docker compose logs -f kafka      # tail broker logs
+#    docker compose logs -f postgres   # tail PostgreSQL logs
 #
 #  Topic auto-creation is ON (auto.create.topics.enable=true).
 #  The 'market-trades' topic is created automatically on first produce.
+#  Alert topics 'wash-alerts' and 'pump-dump-alerts' are also auto-created.
 #
-#  To manually create the topic:
+#  PostgreSQL:
+#    Database: surveillance
+#    User:     surveillance
+#    Password: surveillance_local (dev only — override via PG_PASSWORD env var)
+#
+#  To connect via psql:
+#    psql -h localhost -p 5432 -U surveillance -d surveillance
+#
+#  To manually create topics:
 #    docker exec -it kafka kafka-topics.sh \
 #      --bootstrap-server localhost:9092 \
 #      --create --topic market-trades \
 #      --partitions 3 --replication-factor 1
-#
-#  To inspect messages:
-#    docker exec -it kafka kafka-console-consumer.sh \
-#      --bootstrap-server localhost:9092 \
-#      --topic market-trades --from-beginning
 # ============================================================
 
 services:
@@ -68,12 +72,34 @@ services:
       - kafka_data:/var/lib/kafka/data
 
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
       interval: 10s
       timeout: 10s
       retries: 10
       start_period: 30s
 
+  # ---- PostgreSQL 16 (Phase 3+) ----
+  postgres:
+    image: postgres:16-alpine
+    container_name: surveillance-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: surveillance
+      POSTGRES_USER: surveillance
+      POSTGRES_PASSWORD: surveillance_local
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U surveillance -d surveillance"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 volumes:
   kafka_data:
+    driver: local
+  pgdata:
     driver: local

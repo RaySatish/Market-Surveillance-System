@@ -33,6 +33,7 @@ dead_letter/
 
 # Pipeline checkpoints (runtime state for --resume)
 .checkpoints/
+checkpoints/
 
 # ---------- Alerts ----------
 # Alert CSVs are committed so the dashboard works on GitHub/Streamlit Cloud.
@@ -46,3 +47,6 @@ MEMORY.md
 # ---------- Spark / Hadoop runtime ----------
 derby.log
 metastore_db/
+
+# Backup files
+*.bak

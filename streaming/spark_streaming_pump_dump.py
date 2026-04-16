@@ -1,62 +1,97 @@
 """
 SPARK STRUCTURED STREAMING — PUMP & DUMP DETECTOR
-===================================================
-Phase 2: reads live trades from Kafka, detects pump & dump in near-real-time.
+==================================================
+Dual-mode: reads live trades from Kafka, detects pump & dump in near-real-time.
+
+Phase 2 (MODE = "local_streaming"):
+  - Writes alerts to alerts/streaming_pump_dump_alerts.csv via foreachBatch
+
+Phase 3 (MODE = "streaming" or "aws"):
+  - Writes alerts to Kafka topic "pump-dump-alerts" as JSON
+  - alert_consumer.py picks them up and persists to PostgreSQL
 
 How it works:
-  1. Spark Structured Streaming reads from the 'market-trades' Kafka topic
-  2. Parses JSON trade messages into a typed schema
-  3. Applies a 1-minute tumbling window per symbol to build OHLCV bars
-  4. Detects PUMP bars (price rise >= threshold) and DUMP bars (price drop >= threshold)
-  5. Uses a stateful foreachBatch to match PUMP → DUMP sequences across consecutive batches
-  6. Appends confirmed P&D alerts to alerts/streaming_pump_dump_alerts.csv
+  1. Reads JSON trade messages from Kafka topic 'market-trades'
+  2. Builds 1-minute OHLCV bars per symbol using tumbling windows
+  3. In foreachBatch: detects PUMP (price spike + volume surge) then DUMP
+  4. Sinks to CSV (Phase 2) or Kafka alert topic (Phase 3)
 
-Stateful matching:
-  True P&D detection requires looking across time windows (PUMP then DUMP).
-  We maintain a lightweight in-memory state dict per symbol that remembers
-  the last PUMP window. When a DUMP window follows within pd_window_minutes,
-  a P&D alert is fired.
-
-Fault tolerance:
-  - Spark Structured Streaming checkpoints to .checkpoints/streaming_pump_dump/
-  - In-memory pump state is rebuilt from recent alerts on restart
-  - Structured logging
-
-Usage:
-  # Start Kafka first, then the producer:
-  docker compose up -d
-  python streaming/kafka_producer.py --test
-
-  # In a separate terminal, start the streaming detector:
-  python streaming/spark_streaming_pump_dump.py
+Output mode: complete (emits all window results every trigger — no watermark stall)
 """
 
 import os
 import sys
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
 
-# ── Spark environment fix ────────────────────────────────────────────────────
-if "SPARK_HOME" in os.environ:
-    del os.environ["SPARK_HOME"]
-_java17 = "/opt/homebrew/Cellar/openjdk@17/17.0.18/libexec/openjdk.jdk/Contents/Home"
-if os.path.isdir(_java17):
-    os.environ["JAVA_HOME"] = _java17
-# ────────────────────────────────────────────────────────────────────────────
+# ── Project root path fix ──────────────────────────────────────────
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Spark / Java environment ───────────────────────────────────────────────
+import subprocess as _subprocess
+
+def _find_java_home():
+    for ver in ["@11", "@17", "@21", ""]:
+        try:
+            p = _subprocess.run(
+                ["brew", "--prefix", f"openjdk{ver}"],
+                capture_output=True, text=True, timeout=5
+            )
+            path = p.stdout.strip()
+            if path and os.path.isdir(path):
+                return path
+        except Exception:
+            pass
+    return None
+
+_java = _find_java_home()
+if _java:
+    os.environ.setdefault("JAVA_HOME", _java)
+    java_bin = os.path.join(_java, "bin")
+    os.environ["PATH"] = java_bin + ":" + os.environ.get("PATH", "")
+
+import pyspark
+_spark_home = os.path.dirname(os.path.dirname(pyspark.__file__))
+os.environ.setdefault("SPARK_HOME", _spark_home)
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+# ──────────────────────────────────────────────────────────────────────────────
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType
+    StructType, StructField, StringType, DoubleType, LongType, TimestampType
 )
 
-from config import get_config, DETECTION
+from config import get_config, MODE, DETECTION
 from utils.fault_tolerance import get_logger
 
-log = get_logger("streaming_pump_dump")
+log = get_logger("spark_streaming_pump_dump")
+cfg = get_config()
 
-# ============================================================
-#  SCHEMA
-# ============================================================
+# ── Determine sink mode ──────────────────────────────────────────────────────
+PHASE3 = MODE in ("streaming", "aws")
+
+# ── Config ─────────────────────────────────────────────────────────────────
+KAFKA_BROKER   = cfg.get("kafka_bootstrap", cfg.get("kafka_broker", "localhost:9092"))
+KAFKA_TOPIC    = cfg.get("kafka_topic",   "market-trades")
+CHECKPOINT     = cfg.get("checkpoint_pump_dump",
+                         os.path.join(cfg.get("checkpoint_dir", ".checkpoints"), "streaming_pump_dump"))
+ALERTS_DIR     = cfg.get("alerts_dir", "alerts")
+OUTPUT_PATH    = os.path.join(ALERTS_DIR, "streaming_pump_dump_alerts.csv")
+
+PUMP_THRESH    = float(DETECTION.get("pd_pump_threshold",   0.01))   # 1% price rise
+DUMP_THRESH    = float(DETECTION.get("pd_dump_threshold",  -0.01))   # 1% price drop
+VOL_RATIO      = float(DETECTION.get("pd_volume_ratio",     1.5))    # 1.5× baseline
+PD_WINDOW_MIN  = int(DETECTION.get("pd_window_minutes",     3))
+
+# Phase 3: Kafka alert topic
+PD_ALERTS_TOPIC = cfg.get("kafka_pd_alerts_topic", "pump-dump-alerts")
+
+# ── Trade schema ───────────────────────────────────────────────────────────
 TRADE_SCHEMA = StructType([
     StructField("trade_id",   StringType(), True),
     StructField("timestamp",  StringType(), True),
@@ -66,259 +101,229 @@ TRADE_SCHEMA = StructType([
     StructField("side",       StringType(), True),
     StructField("order_id",   StringType(), True),
     StructField("event_type", StringType(), True),
+    StructField("trader_id",  StringType(), True),
 ])
 
-# ============================================================
-#  STATEFUL PUMP TRACKER
-# ============================================================
-# Keeps the most recent confirmed PUMP window per symbol in memory.
-# Structure: { symbol: {"window_start": datetime, "price_chg_pct": float, "peak_price": float} }
+# ── Stateful pump tracker ──────────────────────────────────────────────────
+# { symbol -> {"window_start": datetime, "open_price": float, "close_price": float} }
 _pump_state: dict = {}
 
 
-def _process_batch(batch_df, batch_id):
+def _detect_alerts(pdf, batch_id):
     """
-    foreachBatch handler.
-    Receives 1-minute OHLCV bars for all symbols in this micro-batch.
-    Detects PUMP and DUMP bars, matches PUMP→DUMP sequences, writes alerts.
+    Core detection logic shared by both Phase 2 and Phase 3 sinks.
+    Returns a list of alert dicts.
     """
-    global _pump_state
+    alerts = []
+    now = datetime.utcnow()
 
-    cfg = get_config()
-    alerts_dir = cfg["alerts_dir"]
-    out_path   = os.path.join(alerts_dir, "streaming_pump_dump_alerts.csv")
-    os.makedirs(alerts_dir, exist_ok=True)
+    # Sort bars by window_start per symbol
+    for symbol, grp in pdf.groupby("symbol"):
+        bars = grp.sort_values("window_start").reset_index(drop=True)
 
-    if batch_df.isEmpty():
+        # Compute baseline volume (mean across all bars for this symbol)
+        baseline_vol = bars["total_volume"].mean() if len(bars) > 1 else bars["total_volume"].iloc[0]
+
+        for _, bar in bars.iterrows():
+            open_p  = bar["open_price"]
+            close_p = bar["close_price"]
+            if open_p <= 0:
+                continue
+
+            price_chg = (close_p - open_p) / open_p
+            vol_ratio = bar["total_volume"] / baseline_vol if baseline_vol > 0 else 1.0
+
+            bar_start = bar["window_start"]
+            if hasattr(bar_start, "to_pydatetime"):
+                bar_start = bar_start.to_pydatetime()
+
+            # ── PUMP detection ─────────────────────────────────────────
+            if price_chg >= PUMP_THRESH and vol_ratio >= VOL_RATIO:
+                _pump_state[symbol] = {
+                    "window_start": bar_start,
+                    "price_chg":    price_chg,
+                    "vol_ratio":    vol_ratio,
+                    "close_price":  close_p,
+                }
+                log.info("PUMP detected: %s +%.2f%% vol×%.2f", symbol, price_chg*100, vol_ratio)
+
+            # ── DUMP detection (only if prior PUMP within window) ──────
+            elif price_chg <= DUMP_THRESH and symbol in _pump_state:
+                pump = _pump_state[symbol]
+                pump_dt = pump["window_start"]
+                diff_min = (bar_start - pump_dt).total_seconds() / 60 if bar_start > pump_dt else 999
+
+                if 0 < diff_min <= PD_WINDOW_MIN:
+                    severity = (
+                        "CRITICAL" if abs(price_chg) > abs(DUMP_THRESH) * 3
+                        else "HIGH" if abs(price_chg) > abs(DUMP_THRESH) * 2
+                        else "MEDIUM"
+                    )
+                    alerts.append({
+                        "window_start":      pump_dt.isoformat() if hasattr(pump_dt, "isoformat") else str(pump_dt),
+                        "window_end":        bar_start.isoformat() if hasattr(bar_start, "isoformat") else str(bar_start),
+                        "symbol":            symbol,
+                        "phase":             "DUMP",
+                        "pump_price_chg_pct": round(pump["price_chg"] * 100, 4),
+                        "dump_price_chg_pct": round(price_chg * 100, 4),
+                        "price_change_pct":  round(price_chg * 100, 4),
+                        "volume_ratio":       round(vol_ratio, 4),
+                        "severity":           severity,
+                        "alert_type":         "PUMP_DUMP",
+                        "detected_at":        now.isoformat(),
+                    })
+                    log.info("PUMP+DUMP confirmed: %s severity=%s", symbol, severity)
+                    del _pump_state[symbol]
+
+    # Expire stale pump states
+    stale = [s for s, p in _pump_state.items()
+             if (now - (p["window_start"] if not hasattr(p["window_start"], "total_seconds")
+                        else p["window_start"])).total_seconds() / 60 > PD_WINDOW_MIN * 2]
+    for s in stale:
+        del _pump_state[s]
+
+    return alerts
+
+
+# ── foreachBatch writer (Phase 2: CSV sink) ──────────────────────────────────
+def _process_batch_csv(batch_df, batch_id):
+    """Phase 2: Receives OHLCV bars, detects P&D, writes alerts to CSV."""
+    if batch_df.rdd.isEmpty():
+        log.info("Batch %d: empty", batch_id)
         return
 
     pdf = batch_df.toPandas()
-    log.info("Batch %d: %d 1-min bars across %d symbols",
-             batch_id, len(pdf), pdf["symbol"].nunique())
+    log.info("Batch %d: %d OHLCV bars", batch_id, len(pdf))
 
-    price_spike_pct = DETECTION.get("pd_price_spike_pct", 0.08)
-    window_minutes  = DETECTION.get("pd_window_minutes",  3)
-    pd_alerts       = []
+    alerts = _detect_alerts(pdf, batch_id)
 
-    for symbol, sym_bars in pdf.groupby("symbol"):
-        sym_bars = sym_bars.sort_values("window_start").reset_index(drop=True)
+    if not alerts:
+        log.info("Batch %d: no P&D alerts", batch_id)
+        return
 
-        for _, bar in sym_bars.iterrows():
-            bar_start    = bar["window_start"]
-            price_chg    = bar["price_chg_pct"]
-            is_pump      = price_chg >= price_spike_pct
-            is_dump      = price_chg <= -price_spike_pct
-
-            if is_pump:
-                # Record this PUMP window in state
-                _pump_state[symbol] = {
-                    "window_start":   bar_start,
-                    "price_chg_pct":  price_chg,
-                    "peak_price":     bar["high"],
-                    "buy_vol":        bar["buy_vol"],
-                }
-                log.debug("%s PUMP detected at %s (%.4f%%)", symbol, bar_start, price_chg)
-
-            elif is_dump and symbol in _pump_state:
-                # Check if DUMP follows PUMP within window_minutes
-                pump = _pump_state[symbol]
-                try:
-                    # bar_start may be a pandas Timestamp or string
-                    if hasattr(bar_start, 'to_pydatetime'):
-                        bar_dt  = bar_start.to_pydatetime()
-                        pump_dt = pump["window_start"].to_pydatetime() if hasattr(pump["window_start"], 'to_pydatetime') else pump["window_start"]
-                    else:
-                        bar_dt  = datetime.fromisoformat(str(bar_start))
-                        pump_dt = datetime.fromisoformat(str(pump["window_start"]))
-
-                    time_diff_min = (bar_dt - pump_dt).total_seconds() / 60
-                except Exception:
-                    time_diff_min = 999
-
-                if 0 < time_diff_min <= window_minutes:
-                    severity = "CRITICAL" if abs(pump["price_chg_pct"]) > 0.3 else "HIGH"
-                    pd_alerts.append({
-                        "alert_type":       "PUMP_AND_DUMP_STREAM",
-                        "symbol":           symbol,
-                        "pump_window_start": pump["window_start"],
-                        "dump_window_start": bar_start,
-                        "pump_price_chg":   round(pump["price_chg_pct"], 4),
-                        "dump_price_chg":   round(price_chg, 4),
-                        "peak_price":       round(float(pump["peak_price"]), 2),
-                        "trough_price":     round(float(bar["low"]), 2),
-                        "pump_buy_vol":     round(float(pump["buy_vol"]), 4),
-                        "dump_sell_vol":    round(float(bar["sell_vol"]), 4),
-                        "severity":         severity,
-                        "detected_at":      datetime.now().isoformat(),
-                    })
-                    log.info("%s PUMP→DUMP confirmed! pump=%.4f%% dump=%.4f%% (%.1f min apart)",
-                             symbol, pump["price_chg_pct"], price_chg, time_diff_min)
-                    # Clear pump state after match to avoid duplicate alerts
-                    del _pump_state[symbol]
-
-    # Expire stale pump states older than 2× window_minutes
-    now = datetime.now()
-    stale = []
-    for sym, pump in _pump_state.items():
-        try:
-            if hasattr(pump["window_start"], 'to_pydatetime'):
-                pump_dt = pump["window_start"].to_pydatetime()
-            else:
-                pump_dt = datetime.fromisoformat(str(pump["window_start"]))
-            if (now - pump_dt).total_seconds() / 60 > window_minutes * 2:
-                stale.append(sym)
-        except Exception:
-            stale.append(sym)
-    for sym in stale:
-        del _pump_state[sym]
-
-    # Write alerts
-    if pd_alerts:
-        import pandas as pd
-        alerts_df   = pd.DataFrame(pd_alerts)
-        file_exists = os.path.exists(out_path)
-        alerts_df.to_csv(out_path, mode="a", header=not file_exists, index=False)
-        log.info("Appended %d P&D alerts → %s", len(pd_alerts), out_path)
+    import pandas as pd
+    alerts_df = pd.DataFrame(alerts)
+    os.makedirs(ALERTS_DIR, exist_ok=True)
+    file_exists = os.path.exists(OUTPUT_PATH)
+    alerts_df.to_csv(OUTPUT_PATH, mode="a", header=not file_exists, index=False)
+    log.info("Batch %d: wrote %d P&D alerts → %s", batch_id, len(alerts_df), OUTPUT_PATH)
 
 
-# ============================================================
-#  MAIN STREAMING JOB
-# ============================================================
-def run_streaming_pump_dump():
-    cfg = get_config()
-    bootstrap      = cfg.get("kafka_bootstrap", "localhost:9092")
-    topic          = cfg.get("kafka_topic",     "market-trades")
-    checkpoint_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        ".checkpoints", "streaming_pump_dump"
+# ── foreachBatch writer (Phase 3: Kafka alert topic sink) ────────────────────
+def _process_batch_kafka(batch_df, batch_id):
+    """
+    Phase 3: Receives OHLCV bars, detects P&D, publishes alerts to Kafka
+    alert topic. alert_consumer.py picks them up for PostgreSQL.
+    """
+    if batch_df.rdd.isEmpty():
+        log.info("Batch %d: empty", batch_id)
+        return
+
+    pdf = batch_df.toPandas()
+    log.info("Batch %d: %d OHLCV bars", batch_id, len(pdf))
+
+    alerts = _detect_alerts(pdf, batch_id)
+
+    if not alerts:
+        log.info("Batch %d: no P&D alerts", batch_id)
+        return
+
+    from kafka import KafkaProducer
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BROKER,
+        value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
     )
 
-    log.info("Starting Spark Structured Streaming — Pump & Dump Detector")
-    log.info("Kafka broker : %s", bootstrap)
-    log.info("Topic        : %s", topic)
-    log.info("Checkpoint   : %s", checkpoint_dir)
+    count = 0
+    for alert_dict in alerts:
+        producer.send(PD_ALERTS_TOPIC, value=alert_dict)
+        count += 1
+
+    producer.flush()
+    producer.close()
+    log.info("Batch %d: published %d P&D alerts → Kafka topic '%s'",
+             batch_id, count, PD_ALERTS_TOPIC)
+
+
+# ── Main streaming job ─────────────────────────────────────────────────────
+def run():
+    sink_label = "Kafka topic" if PHASE3 else "CSV"
+    log.info("Creating Spark session... (sink: %s, MODE=%s)", sink_label, MODE)
 
     spark = (
         SparkSession.builder
-        .appName("MarketSurveillance-StreamingPumpDump")
+        .appName("PumpDumpDetector")
         .master("local[2]")
+        .config("spark.jars.packages",
+                "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3")
         .config("spark.sql.shuffle.partitions", "4")
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0"
-        )
+        .config("spark.driver.memory", "1g")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
+    log.info("Spark session ready. Connecting to Kafka %s topic=%s", KAFKA_BROKER, KAFKA_TOPIC)
 
-    # ── Step 1: Read from Kafka ──────────────────────────────────────────────
-    raw_stream = (
+    # ── Step 1: Read from Kafka ────────────────────────────────────────────
+    raw = (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", bootstrap)
-        .option("subscribe", topic)
+        .option("kafka.bootstrap.servers", KAFKA_BROKER)
+        .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", "latest")
         .option("failOnDataLoss", "false")
         .load()
     )
 
-    # ── Step 2: Parse JSON ───────────────────────────────────────────────────
-    trades = (
-        raw_stream
-        .select(
-            F.from_json(
-                F.col("value").cast("string"),
-                TRADE_SCHEMA
-            ).alias("trade")
-        )
-        .select("trade.*")
-        .withColumn("event_time", F.to_timestamp(F.col("timestamp")))
+    # ── Step 2: Parse JSON ─────────────────────────────────────────────────
+    parsed = (
+        raw
+        .select(F.from_json(F.col("value").cast("string"), TRADE_SCHEMA).alias("d"))
+        .select("d.*")
+        .withColumn("event_time", F.to_timestamp("timestamp"))
         .filter(F.col("event_time").isNotNull())
-        .filter(F.col("symbol").isNotNull())
+        .filter(F.col("quantity") > 0)
+        .filter(F.col("symbol").isin("BTCUSDT", "ETHUSDT", "SOLUSDT"))
     )
 
-    # ── Step 3: 1-minute OHLCV tumbling windows ──────────────────────────────
-    buy_trades  = trades.filter(F.col("side") == "BUY")
-    sell_trades = trades.filter(F.col("side") == "SELL")
-
+    # ── Step 3: 1-minute OHLCV tumbling windows (complete mode) ───────────
     ohlcv = (
-        trades
-        .withWatermark("event_time", "30 seconds")
+        parsed
         .groupBy(
             F.window(F.col("event_time"), "1 minute"),
             F.col("symbol")
         )
         .agg(
-            F.first("price").alias("open"),
-            F.max("price").alias("high"),
-            F.min("price").alias("low"),
-            F.last("price").alias("close"),
-            F.sum("quantity").alias("total_vol"),
-        )
-    )
-
-    buy_vol = (
-        buy_trades
-        .withWatermark("event_time", "30 seconds")
-        .groupBy(
-            F.window(F.col("event_time"), "1 minute"),
-            F.col("symbol")
-        )
-        .agg(F.sum("quantity").alias("buy_vol"))
-    )
-
-    sell_vol = (
-        sell_trades
-        .withWatermark("event_time", "30 seconds")
-        .groupBy(
-            F.window(F.col("event_time"), "1 minute"),
-            F.col("symbol")
-        )
-        .agg(F.sum("quantity").alias("sell_vol"))
-    )
-
-    # Join OHLCV with buy/sell volumes
-    bars = (
-        ohlcv
-        .join(buy_vol,  on=["window", "symbol"], how="left")
-        .join(sell_vol, on=["window", "symbol"], how="left")
-        .withColumn("buy_vol",  F.coalesce(F.col("buy_vol"),  F.lit(0.0)))
-        .withColumn("sell_vol", F.coalesce(F.col("sell_vol"), F.lit(0.0)))
-        .withColumn(
-            "price_chg_pct",
-            F.when(
-                F.col("open") > 0,
-                ((F.col("close") - F.col("open")) / F.col("open")) * 100
-            ).otherwise(0.0)
+            F.first("price").alias("open_price"),
+            F.last("price").alias("close_price"),
+            F.max("price").alias("high_price"),
+            F.min("price").alias("low_price"),
+            F.sum("quantity").alias("total_volume"),
+            F.count("*").alias("trade_count"),
         )
         .withColumn("window_start", F.col("window.start"))
         .withColumn("window_end",   F.col("window.end"))
-        .select(
-            "symbol", "window_start", "window_end",
-            "open", "high", "low", "close",
-            "total_vol", "buy_vol", "sell_vol", "price_chg_pct"
-        )
+        .drop("window")
     )
 
-    # ── Step 4: Write via foreachBatch (stateful P&D matching) ───────────────
+    # ── Step 4: Write via foreachBatch (stateful P&D matching) ────────────
+    # Phase 2: CSV sink | Phase 3+: Kafka alert topic sink
+    batch_fn = _process_batch_kafka if PHASE3 else _process_batch_csv
+
     query = (
-        bars.writeStream
-        .outputMode("append")
-        .foreachBatch(_process_batch)
-        .option("checkpointLocation", checkpoint_dir)
-        .trigger(processingTime="30 seconds")
+        ohlcv
+        .writeStream
+        .outputMode("complete")
+        .foreachBatch(batch_fn)
+        .trigger(processingTime="15 seconds")
+        .option("checkpointLocation", CHECKPOINT)
         .start()
     )
 
-    log.info("Streaming pump & dump detector running. Press Ctrl+C to stop.")
-    try:
-        query.awaitTermination()
-    except KeyboardInterrupt:
-        log.info("Stopped by user.")
-        query.stop()
-    finally:
-        spark.stop()
+    log.info("Streaming query started (sink=%s). Waiting for data... (Ctrl+C to stop)", sink_label)
+    query.awaitTermination()
 
 
 if __name__ == "__main__":
-    run_streaming_pump_dump()
+    run()
