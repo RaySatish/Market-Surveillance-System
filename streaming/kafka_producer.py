@@ -1,7 +1,7 @@
 """
 KAFKA PRODUCER — MARKET TRADES
 ================================
-Phase 2+: Binance WebSocket → Kafka topic (Docker KRaft broker)
+Binance WebSocket → Kafka topic (Docker KRaft broker)
 
 What this does:
   1. Connects to the Binance WebSocket stream for BTC, ETH, SOL
@@ -11,7 +11,7 @@ What this does:
      'market-trades' Kafka topic
   5. Invalid rows go to the dead-letter queue
 
-Phase 3 enhancement (REST backfill):
+REST backfill on reconnect:
   - Tracks last_trade_timestamp from WebSocket stream
   - On reconnect, if gap > GAP_THRESHOLD seconds:
     - Calls Binance REST API for the gap window

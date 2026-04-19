@@ -1,10 +1,17 @@
-pandas>=1.5.0
-pyarrow>=12.0.0
-streamlit>=1.28.0
-plotly>=5.15.0
-requests>=2.28.0
-kafka-python>=2.0.2
-websocket-client>=1.6.0
-numpy>=1.24.0
-setuptools>=68.0
-psycopg2-binary>=2.9.0
+# Market Surveillance for Trade Abuse Detection
+# Pinned versions for reproducibility (Python 3.10+)
+#
+# Install: pip install -r requirements.txt
+# PySpark also requires Java 11+ (OpenJDK recommended)
+
+kafka-python==2.3.0
+numpy==2.4.4
+pandas==3.0.2
+plotly==6.6.0
+psycopg2-binary==2.9.11
+pyarrow==23.0.1
+pyspark==3.5.3
+requests==2.33.1
+streamlit==1.56.0
+websocket-client==1.9.0
+matplotlib==3.10.8

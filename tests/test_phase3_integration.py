@@ -1,7 +1,7 @@
 """
-PHASE 3 INTEGRATION TEST
+INTEGRATION TEST
 =========================
-End-to-end test for the Phase 3 streaming pipeline.
+End-to-end test for the streaming pipeline.
 
 Prerequisites:
   docker compose up -d   (Kafka + PostgreSQL must be running)
@@ -36,7 +36,7 @@ from config import get_config, MODE
 
 if MODE not in ("streaming", "aws"):
     print("WARNING: config.py MODE is '{}', not 'streaming'.".format(MODE))
-    print("   Set MODE = 'streaming' in config.py for full Phase 3 testing.\n")
+    print("   Ensure Docker is running (docker compose up -d).\n")
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -383,7 +383,7 @@ def test_alert_consumer():
 # ============================================================
 def test_full_pipeline(quick=False):
     print("\n" + "=" * 60)
-    print("TEST 7: Full Pipeline (phase3 --test)")
+    print("TEST 7: Full Pipeline (--test)")
     print("=" * 60)
 
     if quick:
@@ -403,7 +403,7 @@ def test_full_pipeline(quick=False):
         cur.close()
         conn.close()
 
-        log_result("Starting pipeline (phase3 --test)", True, "Will run for ~45s")
+        log_result("Starting pipeline (--test)", True, "Will run for ~45s")
 
         pipeline = subprocess.Popen(
             [sys.executable, "streaming/run_streaming_pipeline.py",
@@ -479,12 +479,12 @@ def print_summary():
 #  MAIN
 # ============================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Phase 3 integration tests")
+    parser = argparse.ArgumentParser(description="Integration tests")
     parser.add_argument("--quick", action="store_true",
                         help="Skip slow tests (full pipeline)")
     args = parser.parse_args()
 
-    print("PHASE 3 INTEGRATION TESTS")
+    print("INTEGRATION TESTS")
     print("=" * 60)
     print("Config MODE: {}".format(MODE))
     print("Quick mode:  {}".format(args.quick))

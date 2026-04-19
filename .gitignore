@@ -50,3 +50,12 @@ metastore_db/
 
 # Backup files
 *.bak
+
+# ---------- Paper / SoftwareX draft ----------
+# Paper lives locally, not in the repo (software-only repo)
+paper/
+create_softwarex_paper.py
+scripts/
+*.docx
+~$*.docx
+Screenshot*.png

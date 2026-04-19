@@ -1,16 +1,8 @@
 """
 STREAMING PIPELINE ORCHESTRATOR
 ================================
-Dual-mode orchestrator for Phase 2 and Phase 3 streaming pipelines.
+Orchestrates the full streaming pipeline:
 
-Phase 2 (--mode phase2, default):
-  1. Checks Kafka is reachable
-  2. Ensures 'market-trades' topic exists
-  3. Starts Kafka producer (Binance WebSocket OR synthetic test data)
-  4. Starts both Spark Structured Streaming detectors → CSV sinks
-  5. Monitors all processes; shuts down cleanly on Ctrl+C
-
-Phase 3 (--mode phase3):
   1. Checks Kafka is reachable
   2. Ensures 'market-trades', 'wash-alerts', 'pump-dump-alerts' topics exist
   3. Checks PostgreSQL is reachable; initialises schema if needed
@@ -22,15 +14,10 @@ Phase 3 (--mode phase3):
 Usage:
   docker compose up -d
 
-  # Phase 2 (CSV sinks):
-  python streaming/run_streaming_pipeline.py --test
-  python streaming/run_streaming_pipeline.py --live
+  python streaming/run_streaming_pipeline.py --test     # synthetic data
+  python streaming/run_streaming_pipeline.py --live     # real Binance WebSocket
 
-  # Phase 3 (Kafka + PostgreSQL):
-  python streaming/run_streaming_pipeline.py --mode phase3 --test
-  python streaming/run_streaming_pipeline.py --mode phase3 --live
-
-Architecture (Phase 3):
+Architecture:
   run_streaming_pipeline.py
     ├── Subprocess 1: alert_consumer.py (Kafka → PostgreSQL)
     ├── Subprocess 2: spark_streaming_wash.py (→ Kafka: wash-alerts)
@@ -49,12 +36,12 @@ import os
 import signal
 import shutil
 
-# ── Project root path fix ──────────────────────────────────────────
+# ── Project root path fix ──────────────────────────────────
 import sys as _sys, os as _os
 _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _root not in _sys.path:
     _sys.path.insert(0, _root)
-# ───────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────
 from utils.fault_tolerance import get_logger
 from config import get_config
 
@@ -117,7 +104,7 @@ def ensure_topic(bootstrap: str, topic: str, num_partitions: int = 3):
 
 
 # ============================================================
-#  POSTGRESQL HEALTH CHECK (Phase 3)
+#  POSTGRESQL HEALTH CHECK
 # ============================================================
 def wait_for_postgres(cfg: dict, retries: int = 10, delay: float = 3.0) -> bool:
     """Poll PostgreSQL until it responds or we run out of retries."""
@@ -152,7 +139,7 @@ def wait_for_postgres(cfg: dict, retries: int = 10, delay: float = 3.0) -> bool:
 
 
 def init_db_schema():
-    """Initialise PostgreSQL schema (Phase 3)."""
+    """Initialise PostgreSQL schema."""
     try:
         from streaming.db import init_schema
         init_schema()
@@ -199,7 +186,7 @@ def start_pump_dump_detector() -> subprocess.Popen:
 
 
 def start_alert_consumer() -> subprocess.Popen:
-    """Launch alert_consumer.py as a subprocess (Phase 3 only)."""
+    """Launch alert_consumer.py as a subprocess."""
     root = _project_root()
     cmd  = [sys.executable, "-m", "streaming.alert_consumer"]
     log.info("Starting alert consumer (Kafka → PostgreSQL): %s", " ".join(cmd))
@@ -211,7 +198,7 @@ def start_alert_consumer() -> subprocess.Popen:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Streaming pipeline orchestrator (Phase 2 & Phase 3)"
+        description="Streaming pipeline orchestrator"
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--live",  action="store_true",
@@ -224,63 +211,51 @@ def main():
                         help="Skip starting the producer (if already running)")
     parser.add_argument("--detectors-only", action="store_true",
                         help="Start only the Spark streaming detectors")
-    parser.add_argument("--mode", choices=["phase2", "phase3"], default="phase2",
-                        help="Pipeline mode: phase2 (CSV sinks) or phase3 (Kafka + PostgreSQL)")
+    # Keep --mode for backward compatibility (reproduce.sh passes --mode phase3)
+    parser.add_argument("--mode", default="phase3",
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     cfg       = get_config()
     bootstrap = cfg.get("kafka_bootstrap", "localhost:9092")
     topic     = cfg.get("kafka_topic",     "market-trades")
-    is_phase3 = args.mode == "phase3"
-
-    phase_label = "Phase 3 (Kafka alerts + PostgreSQL)" if is_phase3 else "Phase 2 (CSV sinks)"
 
     log.info("=" * 60)
-    log.info("Streaming Pipeline — %s", phase_label)
+    log.info("Streaming Pipeline — Kafka + PostgreSQL")
     log.info("Mode      : %s", "LIVE (Binance WebSocket)" if args.live else "TEST (synthetic)")
     log.info("Kafka     : %s", bootstrap)
     log.info("Topic     : %s", topic)
-    if is_phase3:
-        log.info("PostgreSQL: %s:%s/%s",
-                 cfg.get("pg_host", "localhost"),
-                 cfg.get("pg_port", 5432),
-                 cfg.get("pg_database", "surveillance"))
+    log.info("PostgreSQL: %s:%s/%s",
+             cfg.get("pg_host", "localhost"),
+             cfg.get("pg_port", 5432),
+             cfg.get("pg_database", "surveillance"))
     log.info("=" * 60)
 
-    # ── Step 1: Check Kafka is up ────────────────────────────────────────────
+    # ── Step 1: Check Kafka is up ────────────────────────────────────────
     if not wait_for_kafka(bootstrap):
         log.error("Kafka is not reachable. Start it with: docker compose up -d")
         sys.exit(1)
 
-    # ── Step 2: Ensure topics exist ──────────────────────────────────────────
+    # ── Step 2: Ensure topics exist ──────────────────────────────────────
     ensure_topic(bootstrap, topic)
-    if is_phase3:
-        # Phase 3: also create alert topics
-        wash_alerts_topic = cfg.get("kafka_wash_alerts_topic", "wash-alerts")
-        pd_alerts_topic   = cfg.get("kafka_pd_alerts_topic", "pump-dump-alerts")
-        ensure_topic(bootstrap, wash_alerts_topic)
-        ensure_topic(bootstrap, pd_alerts_topic)
+    wash_alerts_topic = cfg.get("kafka_wash_alerts_topic", "wash-alerts")
+    pd_alerts_topic   = cfg.get("kafka_pd_alerts_topic", "pump-dump-alerts")
+    ensure_topic(bootstrap, wash_alerts_topic)
+    ensure_topic(bootstrap, pd_alerts_topic)
 
-    # ── Step 3 (Phase 3 only): Check PostgreSQL and init schema ──────────────
-    if is_phase3:
-        if not wait_for_postgres(cfg):
-            log.error("PostgreSQL is not reachable. Start it with: docker compose up -d")
-            sys.exit(1)
-        init_db_schema()
+    # ── Step 3: Check PostgreSQL and init schema ─────────────────────────
+    if not wait_for_postgres(cfg):
+        log.error("PostgreSQL is not reachable. Start it with: docker compose up -d")
+        sys.exit(1)
+    init_db_schema()
 
     processes = []
 
-    # ── Step 4: Clear stale streaming checkpoints ────────────────────────────
-    if is_phase3:
-        checkpoint_dirs = [
-            cfg.get("checkpoint_wash", "checkpoints/phase3_wash"),
-            cfg.get("checkpoint_pump_dump", "checkpoints/phase3_pump_dump"),
-        ]
-    else:
-        checkpoint_dirs = [
-            ".checkpoints/streaming_wash",
-            ".checkpoints/streaming_pump_dump",
-        ]
+    # ── Step 4: Clear stale streaming checkpoints ────────────────────────
+    checkpoint_dirs = [
+        cfg.get("checkpoint_wash", "checkpoints/streaming_wash"),
+        cfg.get("checkpoint_pump_dump", "checkpoints/streaming_pump_dump"),
+    ]
 
     for _ck_dir in checkpoint_dirs:
         # Handle both absolute and relative paths
@@ -292,14 +267,14 @@ def main():
             shutil.rmtree(_full)
             log.info("Cleared stale streaming checkpoint: %s", _full)
 
-    # ── Step 5 (Phase 3 only): Start alert consumer ─────────────────────────
-    if is_phase3 and not args.detectors_only:
+    # ── Step 5: Start alert consumer ─────────────────────────────────────
+    if not args.detectors_only:
         consumer_proc = start_alert_consumer()
         processes.append(consumer_proc)
         log.info("Alert consumer started. Waiting 3s for it to connect...")
         time.sleep(3)
 
-    # ── Step 6: Start Spark streaming detectors ──────────────────────────────
+    # ── Step 6: Start Spark streaming detectors ──────────────────────────
     log.info("Starting Spark Structured Streaming detectors...")
     wash_proc     = start_wash_detector()
     pd_proc       = start_pump_dump_detector()
@@ -309,7 +284,7 @@ def main():
     log.info("Waiting 15s for Spark to initialise...")
     time.sleep(15)
 
-    # ── Step 7: Start Kafka producer ─────────────────────────────────────────
+    # ── Step 7: Start Kafka producer ─────────────────────────────────────
     if not args.no_producer and not args.detectors_only:
         producer_proc = start_producer(
             live=args.live,
@@ -318,13 +293,10 @@ def main():
         processes.append(producer_proc)
 
     log.info("All components started. Press Ctrl+C to stop.")
-    if is_phase3:
-        log.info("Alerts flow: Spark → Kafka alert topics → alert_consumer → PostgreSQL")
-        log.info("Dashboard: streamlit run streaming/stream_alerts_dashboard.py")
-    else:
-        log.info("Streaming alerts will appear in: alerts/streaming_*.csv")
+    log.info("Alerts flow: Spark → Kafka alert topics → alert_consumer → PostgreSQL")
+    log.info("Dashboard: streamlit run streaming/stream_alerts_dashboard.py")
 
-    # ── Step 8: Monitor processes ────────────────────────────────────────────
+    # ── Step 8: Monitor processes ────────────────────────────────────────
     def _shutdown(signum=None, frame=None):
         log.info("Shutting down streaming pipeline...")
         for proc in processes:

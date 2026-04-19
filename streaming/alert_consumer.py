@@ -1,12 +1,12 @@
 """
-streaming/alert_consumer.py — Kafka Alert Consumer → PostgreSQL (Phase 3+)
+streaming/alert_consumer.py — Kafka Alert Consumer → PostgreSQL
 ===========================================================================
 
 Long-running process that:
   1. Subscribes to Kafka topics: wash-alerts, pump-dump-alerts
   2. Deserializes JSON alert messages
   3. Persists to PostgreSQL via db.py (UPSERT — idempotent)
-  4. Logs CRITICAL severity alerts (Phase 3) / publishes to SNS (Phase 4)
+  4. Logs CRITICAL severity alerts
   5. Commits Kafka offsets after successful DB write (at-least-once delivery)
 
 Usage:
@@ -15,7 +15,7 @@ Usage:
 
 Architecture:
   Spark Streaming detectors → Kafka alert topics → THIS CONSUMER → PostgreSQL
-                                                                  → SNS (Phase 4)
+
 
 Delivery guarantee: at-least-once
   - Kafka offset committed AFTER successful DB write
@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable, KafkaError
 
-from config import get_config, MODE
+from config import get_config
 from utils.fault_tolerance import get_logger
 from streaming.db import (
     get_connection,
@@ -109,34 +109,13 @@ def _process_alert(topic, alert_dict, conn):
 
 
 def _handle_critical_alert(alert_dict):
-    """
-    Handle CRITICAL severity alerts.
-    Phase 3: log.critical() only
-    Phase 4 (AWS): publish to SNS topic
-    """
+    """Handle CRITICAL severity alerts by logging them."""
     symbol = alert_dict.get("symbol", "?")
     alert_type = alert_dict.get("alert_type", "?")
     msg = (f"CRITICAL ALERT: {alert_type} on {symbol} — "
            f"{json.dumps(alert_dict, default=str)}")
 
     logger.critical(msg)
-
-    # Phase 4: SNS publish
-    if MODE == "aws":
-        cfg = get_config()
-        sns_arn = cfg.get("sns_critical_topic_arn", "")
-        if sns_arn:
-            try:
-                import boto3
-                sns = boto3.client("sns")
-                sns.publish(
-                    TopicArn=sns_arn,
-                    Subject=f"CRITICAL: {alert_type} on {symbol}",
-                    Message=msg,
-                )
-                logger.info(f"SNS notification sent for {symbol}")
-            except Exception as e:
-                logger.error(f"Failed to publish SNS notification: {e}")
 
 
 # ============================================================
@@ -323,7 +302,7 @@ def run_test():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Kafka alert consumer -> PostgreSQL (Phase 3+)"
+        description="Kafka alert consumer -> PostgreSQL"
     )
     parser.add_argument("--test", action="store_true",
                         help="Publish a test alert to Kafka and exit")

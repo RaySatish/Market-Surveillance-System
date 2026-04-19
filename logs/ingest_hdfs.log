@@ -1,9 +1,0 @@
-[2026-03-04 17:24:00] INFO     ingest_hdfs — Local file: /Users/satishpremanand/Documents/GitHub/Market-Surveillance-for-Trade-Abuse-Detection/trades.csv  (49.5 MB)
-[2026-03-04 17:24:03] INFO     ingest_hdfs — Validation complete — total: 377799, accepted: 377799, rejected → DLQ: 0
-[2026-03-04 17:24:03] INFO     ingest_hdfs — Creating HDFS directory: /market/raw
-[2026-03-04 17:24:04] INFO     ingest_hdfs — Removing old HDFS file (if any): /market/raw/trades.csv
-[2026-03-04 17:24:06] INFO     ingest_hdfs — Uploading to HDFS: /market/raw/trades.csv  (replication=3)
-[2026-03-04 17:24:08] INFO     ingest_hdfs — Verifying HDFS upload…
-[2026-03-04 17:24:09] INFO     ingest_hdfs — HDFS listing:
--rw-r--r--   3 satishpremanand supergroup     49.5 M 2026-03-04 17:24 /market/raw/trades.csv
-[2026-03-04 17:24:09] INFO     ingest_hdfs — INGEST COMPLETE — /Users/satishpremanand/Documents/GitHub/Market-Surveillance-for-Trade-Abuse-Detection/trades.csv → hdfs://localhost:9000/market/raw/trades.csv

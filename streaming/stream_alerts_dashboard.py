@@ -1,23 +1,14 @@
 """
 STREAMING ALERTS DASHBOARD
-============================
-Dual-mode Streamlit dashboard for streaming alert monitoring.
+===========================
+Streamlit dashboard for real-time market surveillance alerts.
 
-Phase 2 (MODE = "local_streaming"):
-  - Reads alerts from CSV files written by Spark streaming detectors
-  - alerts/streaming_wash_alerts.csv
-  - alerts/streaming_pump_dump_alerts.csv
-
-Phase 3 (MODE = "streaming" or "aws"):
-  - Queries PostgreSQL directly via streaming/db.py
-  - Tables: wash_alerts, pump_dump_alerts
+Queries PostgreSQL live with auto-refresh.
 
 Usage:
-  # Phase 2:
   streamlit run streaming/stream_alerts_dashboard.py
 
-  # Phase 3 (PostgreSQL must be running):
-  streamlit run streaming/stream_alerts_dashboard.py
+All timestamps are stored in UTC in PostgreSQL but displayed in IST (UTC+5:30).
 """
 
 import os
@@ -35,7 +26,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from config import get_config, MODE
+from config import get_config
 
 # ── Timezone: display all times in IST ──────────────────────────
 try:
@@ -47,15 +38,9 @@ IST = ZoneInfo("Asia/Kolkata")
 cfg = get_config()
 
 # ── Determine data source mode ─────────────────────────────────────
-# Phase 2: CSV files | Phase 3+: PostgreSQL
-PHASE3 = MODE in ("streaming", "aws")
 
 # Only show alerts for valid trading symbols (filter out test/debug data)
 VALID_SYMBOLS = set(cfg.get("binance_symbols", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
-
-# Phase 2 paths
-WASH_ALERTS_PATH = os.path.join(_ROOT, "alerts", "streaming_wash_alerts.csv")
-PD_ALERTS_PATH   = os.path.join(_ROOT, "alerts", "streaming_pump_dump_alerts.csv")
 
 # ============================================================
 #  PAGE CONFIG
@@ -74,113 +59,66 @@ st.sidebar.title("📡 Streaming Dashboard")
 st.sidebar.markdown("---")
 
 # Show current mode
-mode_label = "Phase 3 (PostgreSQL)" if PHASE3 else "Phase 2 (CSV)"
+mode_label = "PostgreSQL (live)"
 st.sidebar.info(f"**Mode:** {mode_label}")
 
 refresh_interval = st.sidebar.slider(
     "Auto-refresh interval (seconds)",
     min_value=5,
     max_value=60,
-    value=15 if not PHASE3 else 5,
+    value=5,
     step=5,
 )
 
+_all_time = st.sidebar.checkbox("Show all alerts (no time filter)", value=False)
 lookback_minutes = st.sidebar.slider(
     "Show alerts from last N minutes",
     min_value=5,
-    max_value=120,
-    value=30,
+    max_value=1440,
+    value=120,
     step=5,
+    disabled=_all_time,
 )
+if _all_time:
+    lookback_minutes = 999999  # effectively all time
 
-# Phase 3: sidebar filters
+#  sidebar filters
 symbol_filter = None
 severity_filter = None
-if PHASE3:
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Filters (PostgreSQL)**")
-    symbol_filter = st.sidebar.selectbox(
-        "Symbol",
-        ["All", "BTCUSDT", "ETHUSDT", "SOLUSDT"],
-        index=0,
-    )
-    if symbol_filter == "All":
-        symbol_filter = None
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Filters (PostgreSQL)**")
+symbol_filter = st.sidebar.selectbox(
+    "Symbol",
+    ["All", "BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    index=0,
+)
+if symbol_filter == "All":
+    symbol_filter = None
 
-    severity_filter = st.sidebar.selectbox(
-        "Severity",
-        ["All", "CRITICAL", "HIGH", "MEDIUM"],
-        index=0,
-    )
-    if severity_filter == "All":
-        severity_filter = None
+severity_filter = st.sidebar.selectbox(
+    "Severity",
+    ["All", "CRITICAL", "HIGH", "MEDIUM"],
+    index=0,
+)
+if severity_filter == "All":
+    severity_filter = None
 
 st.sidebar.markdown("---")
 
-if PHASE3:
-    st.sidebar.markdown("**Data Source:** PostgreSQL")
-    st.sidebar.markdown(f"`{cfg.get('pg_host', 'localhost')}:{cfg.get('pg_port', 5432)}/{cfg.get('pg_database', 'surveillance')}`")
-else:
-    st.sidebar.markdown("**Alert Files**")
-    st.sidebar.markdown(f"`alerts/streaming_wash_alerts.csv`")
-    st.sidebar.markdown(f"`alerts/streaming_pump_dump_alerts.csv`")
+st.sidebar.markdown("**Data Source:** PostgreSQL")
+st.sidebar.markdown(f"`{cfg.get('pg_host', 'localhost')}:{cfg.get('pg_port', 5432)}/{cfg.get('pg_database', 'surveillance')}`")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "ℹ️ Start the streaming pipeline before running this dashboard:\n\n"
-    "```\ndocker compose up -d\npython streaming/run_streaming_pipeline.py --mode phase3 --test\n```"
-    if PHASE3 else
     "ℹ️ Start the streaming pipeline before running this dashboard:\n\n"
     "```\ndocker compose up -d\npython streaming/run_streaming_pipeline.py --test\n```"
 )
 
 # ============================================================
-#  DATA LOADERS — Phase 2 (CSV)
-# ============================================================
-
-def load_wash_alerts_csv() -> pd.DataFrame:
-    """Phase 2: Load streaming wash trade alerts from CSV."""
-    if not os.path.exists(WASH_ALERTS_PATH):
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(WASH_ALERTS_PATH)
-        if df.empty:
-            return df
-        df["detected_at"] = pd.to_datetime(df["detected_at"], errors="coerce")
-        df["window_start"] = pd.to_datetime(df["window_start"], errors="coerce")
-        df["window_end"]   = pd.to_datetime(df["window_end"],   errors="coerce")
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-def load_pd_alerts_csv() -> pd.DataFrame:
-    """Phase 2: Load streaming pump & dump alerts from CSV."""
-    if not os.path.exists(PD_ALERTS_PATH):
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(PD_ALERTS_PATH)
-        if df.empty:
-            return df
-        df["detected_at"] = pd.to_datetime(df["detected_at"], errors="coerce")
-        # Handle both old and new column names
-        for col in ["pump_window_start", "window_start"]:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-        for col in ["dump_window_start", "window_end"]:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-# ============================================================
-#  DATA LOADERS — Phase 3 (PostgreSQL)
 # ============================================================
 
 def load_wash_alerts_db() -> pd.DataFrame:
-    """Phase 3: Query wash alerts from PostgreSQL."""
+    """ Query wash alerts from PostgreSQL."""
     try:
         from streaming.db import query_alerts
         rows = query_alerts(
@@ -200,28 +138,89 @@ def load_wash_alerts_db() -> pd.DataFrame:
         st.error(f"PostgreSQL query failed: {e}")
         return pd.DataFrame()
 
-
 def load_pd_alerts_db() -> pd.DataFrame:
-    """Phase 3: Query pump & dump alerts from PostgreSQL."""
+    """ Query P&D alerts by matching PUMP→DUMP pairs from sensitivity data.
+    
+    Uses the pd_sensitivity table which evaluates every 1-min OHLCV bar against
+    multiple threshold combinations. Matches PUMP bars followed by DUMP bars on the
+    same symbol within 5 minutes — the signature of a pump-and-dump pattern.
+    """
     try:
-        from streaming.db import query_alerts
-        rows = query_alerts(
-            alert_type="pump_dump",
-            symbol=symbol_filter,
-            severity=severity_filter,
-            limit=2000,
-        )
+        from streaming.db import get_connection
+        import psycopg2.extras as _extras
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=_extras.RealDictCursor)
+        
+        # Find PUMP→DUMP pairs at the most sensitive threshold (0.0005 / 0.5)
+        # This gives the best coverage while still requiring both phases
+        cur.execute("""
+            WITH pumps AS (
+                SELECT symbol, window_start, window_end, price_change_pct, volume_ratio, detected_at
+                FROM pd_sensitivity
+                WHERE flagged = true AND phase = 'PUMP'
+                  AND price_threshold = 0.0005 AND vol_threshold = 0.5
+            ),
+            dumps AS (
+                SELECT symbol, window_start, window_end, price_change_pct, volume_ratio, detected_at
+                FROM pd_sensitivity
+                WHERE flagged = true AND phase = 'DUMP'
+                  AND price_threshold = 0.0005 AND vol_threshold = 0.5
+            ),
+            pairs AS (
+                SELECT DISTINCT ON (p.symbol, p.window_start)
+                    p.symbol,
+                    p.window_start AS pump_start,
+                    p.window_end   AS pump_end,
+                    d.window_start AS dump_start,
+                    d.window_end   AS dump_end,
+                    p.price_change_pct AS pump_price_chg_pct,
+                    d.price_change_pct AS dump_price_chg_pct,
+                    p.volume_ratio     AS pump_vol_ratio,
+                    d.volume_ratio     AS dump_vol_ratio,
+                    GREATEST(p.detected_at, d.detected_at) AS detected_at
+                FROM pumps p
+                JOIN dumps d ON p.symbol = d.symbol
+                    AND d.window_start > p.window_start
+                    AND d.window_start <= p.window_start + INTERVAL '5 minutes'
+                ORDER BY p.symbol, p.window_start, d.window_start
+            )
+            SELECT * FROM pairs ORDER BY pump_start DESC LIMIT 500
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        
         if not rows:
             return pd.DataFrame()
+        
         df = pd.DataFrame(rows)
-        for col in ["detected_at", "window_start", "window_end"]:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
+        # Add standard columns for compatibility
+        df["window_start"] = pd.to_datetime(df["pump_start"])
+        df["window_end"]   = pd.to_datetime(df["dump_end"])
+        df["detected_at"]  = pd.to_datetime(df["detected_at"])
+        df["phase"]        = "PUMP→DUMP"
+        df["alert_type"]   = "PUMP_DUMP"
+        
+        # Severity based on pump magnitude
+        def _severity(row):
+            pct = abs(row["pump_price_chg_pct"])
+            vol = row.get("pump_vol_ratio", 0)
+            if pct > 0.15 or vol > 3.0:
+                return "CRITICAL"
+            elif pct > 0.08 or vol > 1.5:
+                return "HIGH"
+            return "MEDIUM"
+        df["severity"] = df.apply(_severity, axis=1)
+        
+        # Apply filters
+        if symbol_filter:
+            df = df[df["symbol"] == symbol_filter]
+        if severity_filter:
+            df = df[df["severity"] == severity_filter]
+        
         return df
     except Exception as e:
-        st.error(f"PostgreSQL query failed: {e}")
+        st.error(f"PostgreSQL P&D query failed: {e}")
         return pd.DataFrame()
-
 
 # ============================================================
 #  UNIFIED DATA LOADERS
@@ -229,18 +228,17 @@ def load_pd_alerts_db() -> pd.DataFrame:
 
 def load_wash_alerts() -> pd.DataFrame:
     """Load wash alerts from appropriate source based on MODE."""
-    df = load_wash_alerts_db() if PHASE3 else load_wash_alerts_csv()
+    df = load_wash_alerts_db()
     if not df.empty and "symbol" in df.columns:
         df = df[df["symbol"].isin(VALID_SYMBOLS)]
     return _to_ist(df)
 
 def load_pd_alerts() -> pd.DataFrame:
     """Load P&D alerts from appropriate source based on MODE."""
-    df = load_pd_alerts_db() if PHASE3 else load_pd_alerts_csv()
+    df = load_pd_alerts_db()
     if not df.empty and "symbol" in df.columns:
         df = df[df["symbol"].isin(VALID_SYMBOLS)]
     return _to_ist(df)
-
 
 def filter_by_lookback(df: pd.DataFrame, col: str, minutes: int) -> pd.DataFrame:
     """Keep only rows where `col` is within the last `minutes` minutes."""
@@ -253,28 +251,31 @@ def filter_by_lookback(df: pd.DataFrame, col: str, minutes: int) -> pd.DataFrame
         series = series.dt.tz_localize(None)
     return df[series >= cutoff]
 
-
 # ============================================================
 #  UTC → IST CONVERSION
 # ============================================================
 
-_TS_COLS = ["detected_at", "window_start", "window_end",
-            "pump_window_start", "dump_window_start"]
+# Only detected_at is stored as UTC in PostgreSQL.
+# Window timestamps (window_start, window_end, pump_start, dump_start, etc.)
+# are already in IST because Spark uses the JVM default timezone (Asia/Kolkata).
+_UTC_COLS = ["detected_at"]
 
 def _to_ist(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert all known timestamp columns from UTC to IST for display."""
+    """Convert UTC columns (detected_at) to IST for display.
+    
+    Window timestamps are left as-is — Spark writes them in the JVM's
+    local timezone (IST on this host), so no conversion is needed.
+    """
     if df.empty:
         return df
-    for col in _TS_COLS:
+    for col in _UTC_COLS:
         if col not in df.columns:
             continue
         s = df[col]
         if s.dt.tz is None:
-            # Naive timestamps from DB are UTC
             s = s.dt.tz_localize("UTC")
         df[col] = s.dt.tz_convert(IST).dt.tz_localize(None)  # naive IST
     return df
-
 
 # ============================================================
 #  SEVERITY COLOUR MAP
@@ -285,7 +286,6 @@ SEVERITY_COLORS = {
     "MEDIUM":   "#3498db",
 }
 
-
 # ============================================================
 #  MAIN DASHBOARD
 # ============================================================
@@ -295,7 +295,7 @@ def render():
     st.title("📡 Real-Time Market Surveillance")
     st.caption(
         f"Auto-refreshes every **{refresh_interval}s** · "
-        f"Showing last **{lookback_minutes} min** · "
+        f"Showing **all alerts** · " if _all_time else f"Showing last **{lookback_minutes} min** · "
         f"Mode: **{mode_label}** · "
         f"Last loaded: **{datetime.now(IST).strftime('%H:%M:%S IST')}**"
     )
@@ -304,34 +304,29 @@ def render():
     wash_df = load_wash_alerts()
     pd_df   = load_pd_alerts()
 
-    wash_recent = filter_by_lookback(wash_df, "detected_at", lookback_minutes)
-    pd_recent   = filter_by_lookback(pd_df,   "detected_at", lookback_minutes)
+    if _all_time:
+        wash_recent = wash_df
+        pd_recent   = pd_df
+    else:
+        wash_recent = filter_by_lookback(wash_df, "detected_at", lookback_minutes)
+        pd_recent   = filter_by_lookback(pd_df, "window_start" if "window_start" in pd_df.columns else "detected_at", lookback_minutes)
+
+    # ── Debug: data counts (sidebar) ─────────────────────────
+    with st.sidebar.expander("Debug: Data Counts"):
+        st.write(f"Wash raw: {len(wash_df)}, filtered: {len(wash_recent)}")
+        st.write(f"P&D raw: {len(pd_df)}, filtered: {len(pd_recent)}")
+        if not pd_df.empty and "detected_at" in pd_df.columns:
+            st.write(f"P&D date range: {pd_df['detected_at'].min()} to {pd_df['detected_at'].max()}")
 
     # ── Pipeline status banner ───────────────────────────────────
-    if PHASE3:
-        # Phase 3: check PostgreSQL connectivity
-        try:
-            from streaming.db import get_connection
-            conn = get_connection()
-            conn.close()
-            st.success("✅ Connected to PostgreSQL")
-        except Exception as e:
-            st.error(f"❌ PostgreSQL connection failed: {e}")
-    else:
-        # Phase 2: check CSV files
-        wash_file_ok = os.path.exists(WASH_ALERTS_PATH)
-        pd_file_ok   = os.path.exists(PD_ALERTS_PATH)
-
-        if not wash_file_ok and not pd_file_ok:
-            st.warning(
-                "⚠️ No streaming alert files found yet. "
-                "Start the streaming pipeline first:\n\n"
-                "```\ndocker compose up -d\npython streaming/run_streaming_pipeline.py --test\n```"
-            )
-        else:
-            col_w, col_p = st.columns(2)
-            col_w.success("✅ Wash alerts file present") if wash_file_ok else col_w.error("❌ Wash alerts file missing")
-            col_p.success("✅ P&D alerts file present")  if pd_file_ok   else col_p.error("❌ P&D alerts file missing")
+    #  check PostgreSQL connectivity
+    try:
+        from streaming.db import get_connection
+        conn = get_connection()
+        conn.close()
+        st.success("✅ Connected to PostgreSQL")
+    except Exception as e:
+        st.error(f"❌ PostgreSQL connection failed: {e}")
 
     st.markdown("---")
 
@@ -371,10 +366,14 @@ def render():
         tmp = wash_recent[["detected_at", "severity"]].copy()
         tmp["alert_type"] = "Wash Trade"
         all_recent_frames.append(tmp)
-    if not pd_recent.empty and "detected_at" in pd_recent.columns:
-        tmp = pd_recent[["detected_at", "severity"]].copy()
-        tmp["alert_type"] = "Pump & Dump"
-        all_recent_frames.append(tmp)
+    if not pd_recent.empty:
+        # Use window_start (= pump_start) for timeline placement — shows when the event actually happened
+        time_col = "window_start" if "window_start" in pd_recent.columns else "detected_at"
+        if time_col in pd_recent.columns and "severity" in pd_recent.columns:
+            tmp = pd_recent[[time_col, "severity"]].copy()
+            tmp = tmp.rename(columns={time_col: "detected_at"})
+            tmp["alert_type"] = "Pump & Dump"
+            all_recent_frames.append(tmp)
 
     if all_recent_frames:
         combined = pd.concat(all_recent_frames, ignore_index=True)
@@ -408,7 +407,7 @@ def render():
     st.subheader("🔁 Wash Trade Alerts")
 
     if wash_recent.empty:
-        st.info("No wash trade alerts in the last {} minutes.".format(lookback_minutes))
+        st.info("No wash trade alerts found." if _all_time else "No wash trade alerts in the last {} minutes.".format(lookback_minutes))
     else:
         # Severity breakdown pie
         col_pie, col_table = st.columns([1, 2])
@@ -466,9 +465,10 @@ def render():
 
     # ── Section 4: Pump & Dump Alerts ────────────────────────────
     st.subheader("📈📉 Pump & Dump Alerts")
+    st.caption("Matched PUMP→DUMP pairs: price spike followed by reversal on the same symbol within 5 minutes.")
 
     if pd_recent.empty:
-        st.info("No pump & dump alerts in the last {} minutes.".format(lookback_minutes))
+        st.info("No pump & dump patterns detected." if _all_time else "No pump & dump patterns in the last {} minutes.".format(lookback_minutes))
     else:
         col_pie2, col_chart = st.columns([1, 2])
 
@@ -488,41 +488,46 @@ def render():
             st.plotly_chart(fig_sev2, use_container_width=True)
 
         with col_chart:
-            # Pump vs Dump price change scatter — handle both column name styles
-            pump_col = "pump_price_chg_pct" if "pump_price_chg_pct" in pd_recent.columns else "pump_price_chg" if "pump_price_chg" in pd_recent.columns else "price_change_pct"
-            dump_col = "dump_price_chg_pct" if "dump_price_chg_pct" in pd_recent.columns else "dump_price_chg" if "dump_price_chg" in pd_recent.columns else None
-
-            if dump_col and pump_col in pd_recent.columns and dump_col in pd_recent.columns and "symbol" in pd_recent.columns:
+            # Pump vs Dump price change scatter
+            if "pump_price_chg_pct" in pd_recent.columns and "dump_price_chg_pct" in pd_recent.columns:
                 fig_scatter = px.scatter(
                     pd_recent,
-                    x=pump_col,
-                    y=dump_col,
+                    x="pump_price_chg_pct",
+                    y="dump_price_chg_pct",
                     color="symbol",
                     size_max=15,
                     hover_data=["detected_at", "severity"],
-                    title="Pump % vs Dump % per Alert",
+                    title="Pump % vs Dump % per Matched Pair",
                     labels={
-                        pump_col: "Pump Price Change (%)",
-                        dump_col: "Dump Price Change (%)",
+                        "pump_price_chg_pct": "Pump Price Change (%)",
+                        "dump_price_chg_pct": "Dump Price Change (%)",
                     },
                 )
                 fig_scatter.update_layout(height=300)
                 st.plotly_chart(fig_scatter, use_container_width=True)
 
         # Raw table
-        st.markdown("**Recent P&D Alerts**")
+        st.markdown("**Detected P&D Patterns**")
         display_cols2 = [c for c in [
-            "detected_at", "symbol", "severity", "phase",
+            "detected_at", "symbol", "severity",
             "pump_price_chg_pct", "dump_price_chg_pct",
-            "pump_price_chg", "dump_price_chg",
-            "price_change_pct", "volume_ratio",
-            "window_start", "window_end",
-            "pump_window_start", "dump_window_start",
+            "pump_vol_ratio", "dump_vol_ratio",
+            "pump_start", "dump_start",
         ] if c in pd_recent.columns]
         show_df = pd_recent[display_cols2].sort_values("detected_at", ascending=False).head(50).copy()
-        for col in ["pump_price_chg_pct", "dump_price_chg_pct", "pump_price_chg", "dump_price_chg", "price_change_pct"]:
+        # Rename columns for display
+        col_rename = {
+            "pump_price_chg_pct": "Pump %", "dump_price_chg_pct": "Dump %",
+            "pump_vol_ratio": "Pump Vol×", "dump_vol_ratio": "Dump Vol×",
+            "pump_start": "Pump Time", "dump_start": "Dump Time",
+        }
+        show_df = show_df.rename(columns={k: v for k, v in col_rename.items() if k in show_df.columns})
+        for col in ["Pump %", "Dump %"]:
             if col in show_df.columns:
                 show_df[col] = show_df[col].apply(lambda v: f"{v:.4f}%" if pd.notna(v) else "")
+        for col in ["Pump Vol×", "Dump Vol×"]:
+            if col in show_df.columns:
+                show_df[col] = show_df[col].apply(lambda v: f"{v:.2f}×" if pd.notna(v) else "")
         st.dataframe(show_df, use_container_width=True)
 
     st.markdown("---")
@@ -581,7 +586,6 @@ def render():
     st.caption(f"⏳ Next refresh in {refresh_interval} seconds...")
     time.sleep(refresh_interval)
     st.rerun()
-
 
 # ============================================================
 #  ENTRY POINT

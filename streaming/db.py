@@ -1,5 +1,5 @@
 """
-streaming/db.py — PostgreSQL connection and schema management (Phase 3+)
+streaming/db.py — PostgreSQL connection and schema management
 =========================================================================
 
 Provides:
@@ -56,7 +56,7 @@ def get_connection():
         conn.autocommit = False
         return conn
     except psycopg2.OperationalError as e:
-        # Common local Phase 3 dev failure:
+        # Common local dev failure:
         #   role "<pg_user>" does not exist
         # This happens when the Docker volume was created previously with a
         # different POSTGRES_USER, so the new POSTGRES_USER env is ignored.
@@ -129,6 +129,46 @@ CREATE INDEX IF NOT EXISTS idx_pd_detected_at
 
 CREATE INDEX IF NOT EXISTS idx_pd_symbol_detected
     ON pump_dump_alerts (symbol, detected_at DESC);
+
+-- ---- Threshold sensitivity sweep (paper Table 3) ----
+CREATE TABLE IF NOT EXISTS wash_sensitivity (
+    id              SERIAL PRIMARY KEY,
+    window_start    TIMESTAMP NOT NULL,
+    window_end      TIMESTAMP NOT NULL,
+    symbol          VARCHAR(20) NOT NULL,
+    trade_count     INTEGER,
+    total_volume    DOUBLE PRECISION,
+    z_score         DOUBLE PRECISION,
+    threshold       DOUBLE PRECISION NOT NULL,
+    flagged         BOOLEAN NOT NULL,
+    severity        VARCHAR(10),
+    detected_at     TIMESTAMP DEFAULT NOW(),
+    UNIQUE(window_start, window_end, symbol, threshold)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sensitivity_threshold
+    ON wash_sensitivity (threshold, flagged);
+
+-- ---- P&D Threshold sensitivity sweep (paper Table 4) ----
+CREATE TABLE IF NOT EXISTS pd_sensitivity (
+    id                  SERIAL PRIMARY KEY,
+    window_start        TIMESTAMP NOT NULL,
+    window_end          TIMESTAMP NOT NULL,
+    symbol              VARCHAR(20) NOT NULL,
+    price_change_pct    DOUBLE PRECISION,
+    volume_ratio        DOUBLE PRECISION,
+    price_threshold     DOUBLE PRECISION NOT NULL,
+    vol_threshold       DOUBLE PRECISION NOT NULL,
+    phase               VARCHAR(10),
+    flagged             BOOLEAN DEFAULT FALSE,
+    severity            VARCHAR(10),
+    detected_at         TIMESTAMP DEFAULT NOW(),
+    UNIQUE(window_start, symbol, price_threshold, vol_threshold, phase)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pd_sensitivity_thresh
+    ON pd_sensitivity (price_threshold, vol_threshold, flagged);
+
 """
 
 
@@ -425,6 +465,63 @@ def insert_pump_dump_alert(alert_dict, conn=None):
             conn.close()
 
 
+
+
+def insert_wash_sensitivity(row_dict, conn=None):
+    """
+    Insert a threshold sensitivity evaluation row.
+    Used by the streaming wash detector during the sensitivity sweep.
+    ON CONFLICT DO UPDATE so each batch overwrites with the latest z-score.
+    """
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    sql = """
+        INSERT INTO wash_sensitivity
+            (window_start, window_end, symbol, trade_count, total_volume,
+             z_score, threshold, flagged, severity, detected_at)
+        VALUES
+            (%(window_start)s, %(window_end)s, %(symbol)s, %(trade_count)s,
+             %(total_volume)s, %(z_score)s, %(threshold)s, %(flagged)s,
+             %(severity)s, %(detected_at)s)
+        ON CONFLICT (window_start, window_end, symbol, threshold) DO UPDATE SET
+            z_score = EXCLUDED.z_score,
+            trade_count = EXCLUDED.trade_count,
+            total_volume = EXCLUDED.total_volume,
+            flagged = EXCLUDED.flagged,
+            severity = EXCLUDED.severity,
+            detected_at = EXCLUDED.detected_at
+    """
+
+    params = {
+        "window_start":  row_dict["window_start"],
+        "window_end":    row_dict["window_end"],
+        "symbol":        row_dict["symbol"],
+        "trade_count":   row_dict.get("trade_count"),
+        "total_volume":  row_dict.get("total_volume"),
+        "z_score":       row_dict.get("z_score"),
+        "threshold":     row_dict["threshold"],
+        "flagged":       row_dict["flagged"],
+        "severity":      row_dict.get("severity"),
+        "detected_at":   row_dict.get("detected_at", datetime.now(timezone.utc)),
+    }
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.commit()
+        logger.debug(f"Inserted sensitivity row: {row_dict.get('symbol')} "
+                     f"threshold={row_dict.get('threshold')} flagged={row_dict.get('flagged')}")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to insert sensitivity row: {e}")
+    finally:
+        if close_conn:
+            conn.close()
+
+
 # ============================================================
 #  Query (for dashboard)
 # ============================================================
@@ -544,3 +641,66 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ── Pump & Dump Sensitivity Table ──────────────────────────────────────────
+_PD_SENSITIVITY_TABLE = """
+CREATE TABLE IF NOT EXISTS pd_sensitivity (
+    id                  SERIAL PRIMARY KEY,
+    window_start        TIMESTAMP NOT NULL,
+    window_end          TIMESTAMP NOT NULL,
+    symbol              VARCHAR(20) NOT NULL,
+    price_change_pct    DOUBLE PRECISION,
+    volume_ratio        DOUBLE PRECISION,
+    price_threshold     DOUBLE PRECISION NOT NULL,
+    vol_threshold       DOUBLE PRECISION NOT NULL,
+    phase               VARCHAR(10),
+    flagged             BOOLEAN DEFAULT FALSE,
+    severity            VARCHAR(10),
+    detected_at         TIMESTAMP DEFAULT NOW(),
+    UNIQUE(window_start, symbol, price_threshold, vol_threshold, phase)
+);
+"""
+
+def init_pd_sensitivity_schema(conn=None):
+    """Create pd_sensitivity table if it doesn't exist."""
+    close = False
+    if conn is None:
+        conn = get_connection()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_PD_SENSITIVITY_TABLE)
+        conn.commit()
+    finally:
+        if close:
+            conn.close()
+
+
+def insert_pd_sensitivity(row: dict, conn=None):
+    """Insert a P&D sensitivity sweep row (UPSERT)."""
+    close = False
+    if conn is None:
+        conn = get_connection()
+        close = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pd_sensitivity
+                    (window_start, window_end, symbol, price_change_pct, volume_ratio,
+                     price_threshold, vol_threshold, phase, flagged, severity, detected_at)
+                VALUES (%(window_start)s, %(window_end)s, %(symbol)s, %(price_change_pct)s,
+                        %(volume_ratio)s, %(price_threshold)s, %(vol_threshold)s,
+                        %(phase)s, %(flagged)s, %(severity)s, %(detected_at)s)
+                ON CONFLICT (window_start, symbol, price_threshold, vol_threshold, phase)
+                DO UPDATE SET
+                    price_change_pct = EXCLUDED.price_change_pct,
+                    volume_ratio     = EXCLUDED.volume_ratio,
+                    flagged          = EXCLUDED.flagged,
+                    severity         = EXCLUDED.severity,
+                    detected_at      = EXCLUDED.detected_at
+            """, row)
+        conn.commit()
+    finally:
+        if close:
+            conn.close()

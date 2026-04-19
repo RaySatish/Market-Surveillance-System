@@ -1,6 +1,6 @@
 # Market Surveillance for Trade Abuse Detection
 
-A **real-time market surveillance pipeline** that detects manipulative trading patterns — **wash trading** and **pump & dump** schemes — in live cryptocurrency trade data from **Binance**. Built with **Apache Spark**, **Kafka**, **PostgreSQL**, and **Streamlit**.
+A **real-time market surveillance pipeline** that detects manipulative trading patterns — **wash trading** and **pump & dump** schemes — in live cryptocurrency trade data from **Binance**. Built with **Apache Spark Structured Streaming**, **Apache Kafka**, **PostgreSQL**, and **Streamlit**.
 
 > Processes **10,000+ trades per minute** from Binance WebSocket, runs statistical detection algorithms via Spark Structured Streaming, persists alerts to PostgreSQL, and surfaces them on a live-updating dashboard.
 
@@ -25,44 +25,6 @@ A **real-time market surveillance pipeline** that detects manipulative trading p
 ---
 
 ## Architecture
-
-The system is designed in **four progressive phases**, each building on the previous:
-
-### Phase 1 — Batch Pipeline
-
-Fetch historical trades → Spark ETL → Parquet → Batch detectors → CSV alerts → Dashboard.
-
-```mermaid
-flowchart LR
-    A["🌐 Binance REST API"] --> B["📄 trades.csv"]
-    B --> C["⚡ Spark ETL"]
-    C --> D["📦 Parquet\n(partitioned by symbol)"]
-    D --> E["🔍 Wash Detector\n(Z-score)"]
-    D --> F["🔍 P&D Detector\n(price windows)"]
-    E --> G["📊 alerts/"]
-    F --> G
-    G --> H["📈 Streamlit Dashboard"]
-```
-
-### Phase 2 — Streaming Pipeline (CSV Sinks)
-
-Live WebSocket → Kafka → Spark Structured Streaming → CSV alerts → Dashboard auto-refresh.
-
-```mermaid
-flowchart LR
-    A["🌐 Binance WebSocket"] --> B["📨 Kafka Producer"]
-    B --> C[("🔴 Kafka\nmarket-trades")]
-    C --> D["⚡ Spark Streaming\nWash Detector"]
-    C --> E["⚡ Spark Streaming\nP&D Detector"]
-    D --> F["📄 wash_alerts.csv"]
-    E --> G["📄 pd_alerts.csv"]
-    F --> H["📈 Streamlit\n(auto-refresh)"]
-    G --> H
-```
-
-### Phase 3 — Production Streaming (Kafka + PostgreSQL)
-
-CSV sinks replaced with Kafka alert topics → PostgreSQL persistence → live dashboard queries.
 
 ```mermaid
 flowchart TB
@@ -90,42 +52,17 @@ flowchart TB
     style J fill:#FF4B4B,color:#fff
 ```
 
-### Phase 4 — AWS Cloud Deployment
+**Data flow:**
 
-Same codebase as Phase 3 — only infrastructure changes via `config.py`:
+1. **Kafka Producer** connects to Binance WebSocket and publishes live `aggTrade` events for BTCUSDT, ETHUSDT, and SOLUSDT to the `market-trades` Kafka topic. Includes REST backfill on WebSocket reconnect with gap detection.
 
-```mermaid
-flowchart TB
-    A["🌐 Binance WebSocket"] --> B["📨 Kafka Producer\n(on EC2)"]
-    B --> C[("MSK\nAmazon Managed Kafka")]
-    
-    C --> D["⚡ EMR Cluster\nSpark Streaming"]
-    
-    D --> E[("MSK\nAlert Topics")]
-    E --> F["🔄 Alert Consumer\n(on EC2)"]
-    
-    F --> G[("RDS\nPostgreSQL")]
-    F --> H["📧 SNS\nCRITICAL Alerts"]
-    F --> I["🗄️ S3\nAlert Archive"]
-    
-    G --> J["📈 Streamlit\n(EC2)"]
-    
-    style C fill:#FF9900,color:#000
-    style D fill:#FF9900,color:#000
-    style G fill:#FF9900,color:#000
-    style H fill:#FF9900,color:#000
-    style I fill:#FF9900,color:#000
-```
+2. **Spark Structured Streaming** consumes from `market-trades` and runs two parallel detectors:
+   - **Wash Detector** — 2-minute tumbling windows, cross-window Z-score on volume per symbol
+   - **P&D Detector** — 1-minute OHLCV bars, stateful PUMP→DUMP sequential pattern matching
 
-| Local (Phase 3) | AWS (Phase 4) |
-|:---|:---|
-| Docker Kafka (KRaft) | Amazon MSK (3 brokers, 3 AZs) |
-| Spark `local[*]` | Amazon EMR (YARN cluster) |
-| Docker PostgreSQL | Amazon RDS (PostgreSQL) |
-| Local filesystem | Amazon S3 |
-| `log.critical()` | Amazon SNS → Email / Slack / PagerDuty |
+3. **Alert Consumer** subscribes to both alert topics, persists to PostgreSQL with at-least-once delivery (manual Kafka offset commit after successful DB write).
 
-> **Zero code changes** — set `MODE = "aws"` in `config.py` and update endpoint URLs.
+4. **Streamlit Dashboard** queries PostgreSQL live with auto-refresh every 5 seconds. All timestamps displayed in IST (UTC+5:30).
 
 ---
 
@@ -134,12 +71,11 @@ flowchart TB
 | Layer | Technology |
 |:---|:---|
 | **Data Source** | Binance REST API + WebSocket (`aggTrades` — BTCUSDT, ETHUSDT, SOLUSDT) |
-| **Stream Processing** | Apache Kafka 3.7 (KRaft, no Zookeeper) |
-| **Compute Engine** | Apache Spark (PySpark) — batch ETL + Structured Streaming |
-| **Alert Storage** | PostgreSQL 16 (Phase 3+) / CSV (Phase 1–2) |
+| **Stream Processing** | Apache Kafka 3.7 (KRaft mode, no Zookeeper) |
+| **Compute Engine** | Apache Spark (PySpark) — Structured Streaming |
+| **Alert Storage** | PostgreSQL 16 (alert tables + sensitivity tables) |
 | **Dashboard** | Streamlit with Plotly charts |
 | **Containerisation** | Docker Compose (Kafka + PostgreSQL) |
-| **Cloud Ready** | AWS — MSK, EMR, RDS, S3, SNS |
 | **Language** | Python 3.10+ |
 
 ---
@@ -147,23 +83,10 @@ flowchart TB
 ## Project Structure
 
 ```
-├── config.py                        # Central config — all paths, thresholds, MODE switch
-├── run_all_detections.py            # Batch orchestrator: ETL → detectors
-├── dashboard.py                     # Batch Streamlit dashboard
+├── config.py                        # Central config — all paths, thresholds
+├── reproduce.sh                     # One-command reproduction script
 ├── docker-compose.yml               # Kafka (KRaft) + PostgreSQL 16
 ├── requirements.txt
-│
-├── ingestion/
-│   ├── fetch_binance.py             # Binance REST API → trades.csv
-│   └── generate_trades.py           # Synthetic data generator (dev/testing)
-│
-├── etl/
-│   ├── etl_trades.py                # Spark ETL: CSV → cleaned Parquet
-│   └── spark_utils.py               # SparkSession factory + Parquet reader
-│
-├── detectors/
-│   ├── detect_wash_trades.py        # Batch wash trade detector (Z-score)
-│   └── detect_pump_dump.py          # Batch pump & dump detector
 │
 ├── streaming/
 │   ├── kafka_producer.py            # Binance WebSocket → Kafka
@@ -177,86 +100,70 @@ flowchart TB
 ├── utils/
 │   └── fault_tolerance.py           # Retry, validation, safe writes, checkpoints
 │
-├── tests/
-│   └── test_phase3_integration.py   # End-to-end integration tests
-│
-└── alerts/                          # Alert CSVs (committed for dashboard demo)
+└── tests/
+    └── test_phase3_integration.py   # End-to-end integration tests
 ```
 
 ---
 
-## Getting Started
+## Quick Start
 
 ### Prerequisites
 
 - **Python 3.10+**
-- **Java 8 or 11** (required by Spark)
-- **Apache Spark / PySpark**
+- **Java 11+** (required by PySpark)
 - **Docker Desktop** (for Kafka and PostgreSQL)
 
-### Installation
+### One-Command Setup
 
 ```bash
 git clone https://github.com/RaySatish/Market-Surveillance-for-Trade-Abuse-Detection.git
 cd Market-Surveillance-for-Trade-Abuse-Detection
 
+chmod +x reproduce.sh
+./reproduce.sh          # live Binance data → detection → dashboard
+```
+
+This single script will:
+1. Create a virtual environment and install all dependencies
+2. Start Kafka + PostgreSQL via Docker Compose
+3. Initialize the database schema (alert + sensitivity tables)
+4. Launch the streaming pipeline (producer → Spark detectors → alert consumer)
+5. Open the Streamlit dashboard at `http://localhost:8501`
+
+**Other modes:**
+
+```bash
+./reproduce.sh --test   # use synthetic data (no Binance API needed)
+./reproduce.sh --stop   # stop all services and clean up
+```
+
+### Manual Setup
+
+If you prefer step-by-step:
+
+```bash
+# 1. Install dependencies
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
-
+source .venv/bin/activate
 pip install -r requirements.txt
-pip install pyspark
-```
 
-### Fetch Trade Data
-
-```bash
-# Real data from Binance (last 30 minutes of trades)
-python ingestion/fetch_binance.py
-
-# Or: custom time window
-python ingestion/fetch_binance.py --minutes 60
-```
-
----
-
-## Running the Pipeline
-
-### Phase 1 — Batch
-
-```bash
-# Full pipeline: ETL → wash detection → pump & dump detection
-python run_all_detections.py
-
-# Skip ETL, reuse existing Parquet
-python run_all_detections.py --skip-etl
-
-# Resume from last checkpoint (after crash)
-python run_all_detections.py --resume
-
-# View results
-streamlit run dashboard.py
-```
-
-### Phase 3 — Production Streaming
-
-```bash
-# 1. Start infrastructure
+# 2. Start infrastructure
 docker compose up -d
 
-# 2. Initialize database schema
+# 3. Initialize database
 python streaming/db.py --init
 
-# 3. Start the full pipeline (Kafka producer + Spark detectors + alert consumer)
+# 4. Start the streaming pipeline
 python streaming/run_streaming_pipeline.py --mode phase3 --live
 
-# 4. In a new terminal — launch the live dashboard
+# 5. In a new terminal — launch the dashboard
 streamlit run streaming/stream_alerts_dashboard.py
 ```
 
-The dashboard auto-refreshes every 5 seconds, querying PostgreSQL for the latest alerts.
+### Stopping
 
 ```bash
-# Stop everything
 # Ctrl+C in the pipeline terminal, then:
 docker compose down
 ```
@@ -267,7 +174,7 @@ docker compose down
 
 ### Wash Trading — Statistical Volume Anomaly
 
-Binance's public API does not expose trader identity, so classical wash detection (same buyer = seller) is not possible. Instead, the detector uses **Z-score volume anomaly detection**:
+Binance's public API does not expose trader identity, so classical wash detection (same buyer = seller) is not possible. Instead, the detector uses **cross-window Z-score volume anomaly detection**:
 
 ```mermaid
 flowchart LR
@@ -278,6 +185,8 @@ flowchart LR
     E -- Yes --> F["🚨 WASH ALERT\nCRITICAL / HIGH / MEDIUM"]
     E -- No --> G["✅ Normal"]
 ```
+
+The Z-score is computed **across peer windows** in each `foreachBatch`, comparing each window's total volume against all other windows for that symbol. This avoids the self-referencing trap where `mean × count ≈ sum` would always yield Z ≈ 0.
 
 | Severity | Condition |
 |:---|:---|
@@ -305,73 +214,43 @@ flowchart TB
     H --> J["Alert with severity:\nCRITICAL / HIGH / MEDIUM"]
 ```
 
+The detector maintains per-symbol state (`_pump_state`) to track confirmed PUMPs awaiting a matching DUMP. Baseline volume excludes the latest bar to avoid self-comparison. State expires after `pd_window_minutes × 2` without a matching DUMP.
+
 ---
 
 ## Fault Tolerance
 
 Every stage of the pipeline is designed to handle failures gracefully:
 
-```mermaid
-flowchart TB
-    A["Incoming Data"] --> B{"Validation\n(8 required fields)"}
-    B -- Valid --> C["Process"]
-    B -- Invalid --> D["Dead Letter Queue\n(dead_letter/)"]
-    
-    C --> E{"Write Output"}
-    E -- Success --> F["Checkpoint\n(.checkpoints/)"]
-    E -- Failure --> G["Retry with\nExponential Backoff"]
-    G --> E
-    
-    F --> H["Next Stage"]
-    
-    style D fill:#e74c3c,color:#fff
-    style F fill:#27ae60,color:#fff
-```
-
 | Mechanism | Description |
 |:---|:---|
 | **Retry + backoff** | All I/O operations retry with exponential backoff on transient failures |
 | **Row-level validation** | Every trade is validated (8 required fields); rejects go to dead letter queue |
 | **Atomic writes** | Temp file → SHA-256 check → rename (no partial outputs) |
-| **Checkpoints** | JSON checkpoints after each stage; supports `--resume` on crash recovery |
 | **DB-level dedup** | PostgreSQL `ON CONFLICT DO NOTHING` — idempotent even with at-least-once Kafka delivery |
 | **Manual offset commit** | Kafka consumer commits only after successful DB write — no data loss |
+| **WebSocket reconnect** | REST API backfill with gap detection on WebSocket reconnect — no missed trades |
 
 ---
 
 ## Dashboard
 
-### Batch Dashboard
-
-Reads from `trades.csv` and `alerts/` — **no Spark or infrastructure required**. Works immediately after cloning the repo.
-
-- **Alert Overview** — total alerts, breakdown by type and severity
-- **Alert Timeline** — alerts over time (1-minute bins)
-- **Wash Trade Analysis** — severity distribution, Z-score by symbol
-- **Pump & Dump Analysis** — severity distribution, pump vs dump phases
-- **Volume Analysis** — buy vs sell volume, volume over time per symbol
-- **Symbol Risk Scoreboard** — weighted risk score (CRITICAL×3 + HIGH×2 + MEDIUM×1)
-
-### Streaming Dashboard
-
-Queries PostgreSQL live with **auto-refresh every 5 seconds**. All timestamps displayed in **IST (UTC+5:30)**. Includes sidebar filters for symbol, severity, and time window.
+The Streamlit dashboard queries PostgreSQL live with **auto-refresh every 5 seconds**. All timestamps are stored in UTC but displayed in **IST (UTC+5:30)**. Sidebar filters for symbol, severity, and time window.
 
 - **Pipeline Status** — live connection indicator
 - **Real-Time Metrics** — alert count, wash/P&D split, critical count, symbols flagged
 - **Alert Timeline** — color-coded by alert type
-- **Alert Tables** — sortable, filterable raw alert data
+- **Wash Trade Alerts** — window details, Z-scores, severity
+- **Pump & Dump Alerts** — phase (PUMP/DUMP), price change %, volume ratio
+- **Sensitivity Analysis** — threshold sweep results for both detectors
 
 ---
 
 ## Configuration
 
-All thresholds and infrastructure settings are centralized in `config.py`:
+All detection thresholds are centralized in `config.py`:
 
 ```python
-# Switch deployment mode
-MODE = "streaming"    # Options: "local", "local_streaming", "streaming", "aws"
-
-# Detection thresholds
 DETECTION = {
     "wash_zscore_threshold": 0.1,     # Z-score cutoff for wash alerts
     "wash_rolling_window":   "2min",  # tumbling window size
@@ -384,6 +263,76 @@ DETECTION = {
 ```
 
 > **Tuning note:** These thresholds are calibrated for real Binance data on major crypto pairs (BTC, ETH, SOL) where spreads are tight and volume is stable. Lower thresholds → more alerts (higher recall). Higher thresholds → fewer, more confident alerts.
+
+---
+
+## PostgreSQL Schema
+
+```sql
+-- Alert tables
+CREATE TABLE wash_alerts (
+    id              SERIAL PRIMARY KEY,
+    window_start    TIMESTAMP NOT NULL,
+    window_end      TIMESTAMP NOT NULL,
+    symbol          VARCHAR(20) NOT NULL,
+    trade_count     INTEGER,
+    total_volume    DOUBLE PRECISION,
+    mean_volume     DOUBLE PRECISION,
+    std_volume      DOUBLE PRECISION,
+    z_score         DOUBLE PRECISION,
+    severity        VARCHAR(10) NOT NULL,
+    alert_type      VARCHAR(20) DEFAULT 'WASH_TRADE',
+    detected_at     TIMESTAMP DEFAULT NOW(),
+    UNIQUE(window_start, window_end, symbol)
+);
+
+CREATE TABLE pump_dump_alerts (
+    id                  SERIAL PRIMARY KEY,
+    window_start        TIMESTAMP NOT NULL,
+    window_end          TIMESTAMP NOT NULL,
+    symbol              VARCHAR(20) NOT NULL,
+    phase               VARCHAR(10) NOT NULL,
+    price_change_pct    DOUBLE PRECISION,
+    volume_ratio        DOUBLE PRECISION,
+    severity            VARCHAR(10) NOT NULL,
+    alert_type          VARCHAR(20) DEFAULT 'PUMP_DUMP',
+    detected_at         TIMESTAMP DEFAULT NOW(),
+    UNIQUE(window_start, symbol, phase)
+);
+
+-- Sensitivity analysis tables
+CREATE TABLE wash_sensitivity (
+    id              SERIAL PRIMARY KEY,
+    z_threshold     DOUBLE PRECISION NOT NULL,
+    total_windows   INTEGER,
+    alerts_fired    INTEGER,
+    alert_rate_pct  DOUBLE PRECISION,
+    run_ts          TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE pd_sensitivity (
+    id                  SERIAL PRIMARY KEY,
+    price_threshold     DOUBLE PRECISION NOT NULL,
+    volume_ratio        DOUBLE PRECISION NOT NULL,
+    total_bars          INTEGER,
+    pumps_detected      INTEGER,
+    dumps_detected      INTEGER,
+    alert_rate_pct      DOUBLE PRECISION,
+    run_ts              TIMESTAMP DEFAULT NOW()
+);
+```
+
+---
+
+## Testing
+
+```bash
+# Quick integration test (~30 seconds)
+python tests/test_phase3_integration.py --quick
+
+# Full integration test (~90 seconds)
+python tests/test_phase3_integration.py
+```
 
 ---
 
