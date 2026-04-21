@@ -10,6 +10,8 @@ A **real-time market surveillance pipeline** that detects manipulative trading p
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791.svg)](https://postgresql.org)
 [![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B.svg)](https://streamlit.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19649591.svg)](https://doi.org/10.5281/zenodo.19649591)
+
 
 ---
 
