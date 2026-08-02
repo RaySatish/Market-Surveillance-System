@@ -188,7 +188,7 @@ flowchart LR
     E -- No --> G["✅ Normal"]
 ```
 
-The Z-score is computed **across peer windows** in each `foreachBatch`, comparing each window's total volume against all other windows for that symbol. This avoids the self-referencing trap where `mean × count ≈ sum` would always yield Z ≈ 0.
+The Z-score is computed **across peer windows** in each `foreachBatch`, comparing each window's total volume against all other windows for that symbol. This avoids the self-referencing trap where `mean × count ≈ sum` would always yield Z ≈ 0. 
 
 | Severity | Condition |
 |:---|:---|
